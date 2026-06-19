@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 """Build the penalties dataset CSV for a (chain, time range).
 
-One row per auction x winning-solution order, in-market fill-or-kill orders only
-(see docs/dataset.md). Reverted winners are kept and flagged via `settled`.
+One row per auction x winning-solution order -- ALL such orders, with
+partially_fillable / is_out_of_market carried as flags (see docs/dataset.md).
+Reverted winners are kept and flagged via `settled`.
 
 Sources:
   * cow-analytics-db Postgres (ANALYTICS_DB_URL) -- the spine: dbt analytics
@@ -171,8 +172,8 @@ def main() -> None:
     print(f"[db]   {args.environment}_{CHAINS[args.chain]['db_network']} "
           f"{args.start:%Y-%m-%d}..{args.end:%Y-%m-%d}", file=sys.stderr)
     orderbook = fetch_orderbook(args.chain, args.start, args.end, args.environment, args.db_timeout)
-    print(f"[db]   {len(orderbook)} winning in-market FOK orders "
-          f"({int(orderbook['settled'].eq(False).sum())} reverted)", file=sys.stderr)
+    print(f"[db]   {len(orderbook)} winning-solution orders "
+          f"({int(orderbook['settled'].eq(False).sum())} not settled)", file=sys.stderr)
 
     print(f"[dune] fetching {CHAINS[args.chain]['dune']} trades", file=sys.stderr)
     dune = fetch_dune_trades(args.chain, args.start, args.end)

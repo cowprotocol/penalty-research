@@ -2,10 +2,10 @@
 -- in the cow-analytics-db database for one network/environment.
 --
 -- Grain: one row per (auction_id, order_uid) where the order was in that
--- auction's WINNING solution (= one settlement attempt), restricted to
--- in-market, fill-or-kill orders. Two outcomes: settled (a real tx hash) or
--- not settled. We do NOT separate revert vs fail-to-submit, and do not special-
--- case late settlements (kept simple).
+-- auction's WINNING solution (= one settlement attempt). ALL such orders are
+-- kept; partially_fillable and is_out_of_market are carried as flags, not filters.
+-- Two outcomes: settled (a real tx hash) or not settled. We do NOT separate
+-- revert vs fail-to-submit, and do not special-case late settlements (kept simple).
 --
 -- {raw_schema} is interpolated (e.g. raw_prod_polygon). Bind params:
 --   %(start)s, %(end)s   auction-time window [start, end)
@@ -13,11 +13,12 @@
 --   %(solver_env)s       solver-name environment ('prod' | 'barn')
 --
 -- IN-MARKET vs OUT-OF-MARKET: all orders are stored with class='limit'. The
--- marketable subset is condition 1 of the quote-reward eligibility logic in
+-- marketable test is condition 1 of the quote-reward eligibility logic in
 -- cow-dagster's int_backend_data__orders_with_winning_quotes: the *effective*
 -- (gas + volume-fee adjusted) creation quote price meets the limit price. We
--- replicate ONLY that condition (NOT verified / not-excluded / quoter-bid /
--- CIP-72). The full flag is carried through as informational is_quote_reward_eligible.
+-- compute that test as the is_out_of_market flag (its negation), but apply NO
+-- other condition (NOT verified / not-excluded / quoter-bid / CIP-72). The full
+-- quote-reward flag is carried through as informational is_quote_reward_eligible.
 
 -- PERF: map the auction-time window to a block-number range up front so we can
 -- prune winning_solutions by block_deadline BEFORE the heavy joins. Without this,
@@ -77,10 +78,20 @@ order_quote as (
     from dbt.stg_backend_data__order_quotes
 ),
 
--- volume fee per order (assumes one volume fee per order, as the dbt model does)
+-- Corrected volume-fee multiplier per order. Unlike the dbt model (which takes
+-- max(volume_factor) of a single fee), we compound ALL volume fees that apply in
+-- the FIRST auction the order carries them in: multiplier = prod(1 - factor_i).
+-- Most orders carry two volume fees (e.g. protocol + partner), so max() understates
+-- the true take. prod() via exp(sum(ln(...))) -- factors are small (<= 0.01), so safe.
 volume_fee as (
-    select order_uid, max(coalesce(volume_factor, 0)) as volume_factor
-    from dbt.stg_backend_data__fee_policies
+    select order_uid, exp(sum(ln(1 - volume_factor))) as volume_multiplier
+    from (
+        select order_uid, auction_id, volume_factor,
+               min(auction_id) over (partition by order_uid) as first_auction
+        from dbt.stg_backend_data__fee_policies
+        where kind::text = 'volume'
+    ) v
+    where auction_id = first_auction
     group by order_uid
 ),
 
@@ -107,19 +118,20 @@ enriched as (
         o.buy_token,
         o.sell_amount                       as limit_sell_amount,
         o.buy_amount                        as limit_buy_amount,
-        oq.sell_amount                      as quote_sell_amount,
-        oq.buy_amount                       as quote_buy_amount,
-        -- effective quote amounts (gas + volume-fee adjusted), per cow-dagster
+        -- effective (corrected) quote amounts: gas-adjusted, then volume-fee adjusted
+        -- by the compounded multiplier (see volume_fee). Buy orders pay more, so the
+        -- sell side is divided by the multiplier; sell orders receive less, so the buy
+        -- side is multiplied. The raw quote is dropped -- only the corrected one is kept.
         case
             when o.kind::text = 'buy'
                 then (oq.sell_amount + oq.gas_amount * oq.gas_price / nullif(oq.sell_token_price, 0))
-                     * (1 + coalesce(vf.volume_factor, 0))
+                     / coalesce(vf.volume_multiplier, 1)
         end as effective_sell_amount,
         case
             when o.kind::text = 'sell'
                 then ((oq.sell_amount - oq.gas_amount * oq.gas_price / nullif(oq.sell_token_price, 0))
                       * oq.buy_amount / nullif(oq.sell_amount, 0))
-                     * (1 - coalesce(vf.volume_factor, 0))
+                     * coalesce(vf.volume_multiplier, 1)
         end as effective_buy_amount,
         elig.is_eligible_for_quote_reward   as is_quote_reward_eligible,
         hm.calculated_slippage_bps,
@@ -157,20 +169,25 @@ select
     '0x' || encode(sell_token, 'hex')                       as sell_token,
     '0x' || encode(buy_token, 'hex')                        as buy_token,
     kind,
+    partially_fillable,
+    -- out-of-market: effective quote price fails to meet the limit price (= the
+    -- negation of in-market condition 1). null when no quote is available.
+    case
+        when kind::text = 'sell' then effective_buy_amount < limit_buy_amount
+        when kind::text = 'buy'  then limit_sell_amount < effective_sell_amount
+    end                                                     as is_out_of_market,
     executed_sell,
     executed_buy,
     limit_sell_amount,
     limit_buy_amount,
-    quote_sell_amount,
-    quote_buy_amount,
     -- order size in native-token wei (works for settled and not-settled attempts)
     executed_sell * sell_token_native_price / 1e18          as volume_native,
-    -- slippage tolerance: signed (raw) limit vs quote price, in bps
+    -- slippage tolerance: signed limit vs *effective* (corrected) quote price, in bps
     case
-        when kind::text = 'sell' and quote_buy_amount > 0
-            then (quote_buy_amount - limit_buy_amount) / quote_buy_amount * 10000
-        when kind::text = 'buy' and quote_sell_amount > 0
-            then (limit_sell_amount - quote_sell_amount) / quote_sell_amount * 10000
+        when kind::text = 'sell' and effective_buy_amount > 0
+            then (effective_buy_amount - limit_buy_amount) / effective_buy_amount * 10000
+        when kind::text = 'buy' and effective_sell_amount > 0
+            then (limit_sell_amount - effective_sell_amount) / effective_sell_amount * 10000
     end                                                     as slippage_tolerance_bps,
     calculated_slippage_bps,
     smart_slippage,
@@ -194,10 +211,6 @@ select
     seconds_to_settle,
     block_deadline,
     settlement_block
+-- all winning-solution orders are kept; partially_fillable and is_out_of_market are
+-- carried as flags rather than applied as filters.
 from enriched
-where not partially_fillable
-  -- in-market: effective quote price meets the order's limit price (condition 1)
-  and (
-        (kind::text = 'sell' and effective_buy_amount >= limit_buy_amount)
-        or (kind::text = 'buy' and limit_sell_amount >= effective_sell_amount)
-  )

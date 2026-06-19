@@ -27,4 +27,3 @@ left join {{blockchain}}.transactions as txn
     and txn.block_time <  timestamp '{{end_time}}'
 where t.block_time >= timestamp '{{start_time}}'
   and t.block_time <  timestamp '{{end_time}}'
-  and not t.partial_fill
