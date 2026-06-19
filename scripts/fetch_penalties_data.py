@@ -9,7 +9,7 @@ Sources:
   * cow-analytics-db Postgres (ANALYTICS_DB_URL) -- the spine: dbt analytics
     models + raw mirror. One database per network/environment (prod_<network>).
   * Dune (DUNE_API_KEY, saved query 7755542) -- USD order size + markout,
-    joined on order_uid.
+    joined on (order_uid, tx_hash).
 
 Usage:
     python scripts/fetch_penalties_data.py --chain polygon --start 2026-05-01 --end 2026-06-01
@@ -21,7 +21,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -49,6 +49,11 @@ CHAINS: dict[str, dict[str, str]] = {
 # Columns Dune contributes (joined on order_uid + tx_hash). Everything else is from the DB.
 DUNE_COLS = ["order_size_usd", "markout_usd", "markout_relative", "execution_cost_native"]
 
+# The DB spine windows on auction (block_deadline) time; the Dune query windows on the
+# settlement-tx block_time. Pad the Dune fetch so late / window-boundary settlements still
+# match. Over-fetched Dune rows simply don't join (the merge is keyed on order_uid + tx_hash).
+DUNE_WINDOW_BUFFER = timedelta(days=1)
+
 
 # --- connection -------------------------------------------------------------
 
@@ -70,7 +75,7 @@ def db_names(chain: str, environment: str) -> tuple[str, str]:
 
 def fetch_orderbook(chain: str, start: datetime, end: datetime, environment: str,
                     timeout_s: int = 900) -> pd.DataFrame:
-    """Winning in-market FOK orders + reward/penalty + slippage + timing."""
+    """All winning-solution orders + reward/penalty + slippage + timing (one row/attempt)."""
     raw_url = os.environ.get("ANALYTICS_DB_URL")
     if not raw_url:
         sys.exit("ANALYTICS_DB_URL is not set (see .env.example).")
@@ -99,7 +104,7 @@ def fetch_orderbook(chain: str, start: datetime, end: datetime, environment: str
 
 
 def fetch_dune_trades(chain: str, start: datetime, end: datetime) -> pd.DataFrame:
-    """USD order size + markout per settled FOK trade, keyed by order_uid."""
+    """USD order size + markout per settled trade, keyed by (order_uid, tx_hash)."""
     from dune_client.client import DuneClient
     from dune_client.query import QueryBase
     from dune_client.types import QueryParameter
@@ -132,7 +137,7 @@ def normalize_hex(v) -> str | None:
 
 
 def assemble(orderbook: pd.DataFrame, dune: pd.DataFrame) -> pd.DataFrame:
-    """Left-join Dune USD/markout onto the DB spine (keyed by order_uid)."""
+    """Left-join Dune USD/markout onto the DB spine (keyed by (order_uid, tx_hash))."""
     orderbook["order_uid"] = orderbook["order_uid"].map(normalize_hex)
     orderbook["tx_hash"] = orderbook["tx_hash"].map(normalize_hex)
     if dune.empty:
@@ -176,7 +181,8 @@ def main() -> None:
           f"({int(orderbook['settled'].eq(False).sum())} not settled)", file=sys.stderr)
 
     print(f"[dune] fetching {CHAINS[args.chain]['dune']} trades", file=sys.stderr)
-    dune = fetch_dune_trades(args.chain, args.start, args.end)
+    # widen the Dune window so late / boundary settlements still match (see DUNE_WINDOW_BUFFER)
+    dune = fetch_dune_trades(args.chain, args.start - DUNE_WINDOW_BUFFER, args.end + DUNE_WINDOW_BUFFER)
     print(f"[dune] {len(dune)} FOK trades", file=sys.stderr)
 
     result = assemble(orderbook, dune)

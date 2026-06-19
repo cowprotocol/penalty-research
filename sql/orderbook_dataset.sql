@@ -66,7 +66,8 @@ priced as (  -- attach the per-(auction, solver) reward / penalty
         r.uncapped_reward        as reward_penalty_uncapped_native,
         r.is_excluded            as is_excluded_from_penalties,
         r.reference_score,
-        r.observed_score
+        r.observed_score,
+        r.upper_reward_cap       as reward_cap_upper_native
     from windowed
     left join dbt.fct_solver_rewards_per_auction as r
         on r.auction_id = windowed.auction_id and r.solver = windowed.solver
@@ -108,7 +109,14 @@ enriched as (
         p.executed_buy,
         p.reward_penalty_native,
         p.reward_penalty_uncapped_native,
-        p.is_excluded_from_penalties,
+        -- excluded from penalties: an explicitly-excluded auction, OR the auction's
+        -- block_deadline falls in a no-penalties block range (penalty floored to 0).
+        (p.is_excluded_from_penalties
+         or exists (
+             select 1 from dbt.stg_no_penalties_auctions as npa
+             where p.block_deadline between npa.block_deadline_start and npa.block_deadline_end
+         ))                                  as is_excluded_from_penalties,
+        p.reward_cap_upper_native,
         p.reference_score,
         p.observed_score,
         o.kind,
@@ -134,13 +142,11 @@ enriched as (
                      * coalesce(vf.volume_multiplier, 1)
         end as effective_buy_amount,
         elig.is_eligible_for_quote_reward   as is_quote_reward_eligible,
-        hm.calculated_slippage_bps,
         hm.smart_slippage,
         hm.order_duration                   as seconds_to_settle,
         sv.name                             as solver_name,
         rc.batch_reward_cap_lower           as penalty_cap_native,
-        rc.batch_reward_cap_upper           as reward_cap_upper_native,
-        ap.price                            as sell_token_native_price,
+        coalesce(apc.price, ap.price)       as surplus_token_native_price,
         sl.slippage_native,
         sl.slippage_usd
     from priced as p
@@ -152,9 +158,18 @@ enriched as (
     left join dbt.dune_data__cow_protocol__solvers as sv
         on sv.address = p.solver and sv.environment = %(solver_env)s
     left join dbt.reward_config as rc on rc.network = %(network)s
+    -- value the order on its SURPLUS side: buy token for sell orders, sell token for buy
+    -- orders. That token's auction native price is always present. The corrected price
+    -- (stg_auction_prices_corrections) overrides the raw auction price, matching dbt.
     left join {raw_schema}.auction_prices as ap
-        on ap.auction_id = p.auction_id and ap.token = o.sell_token
-    left join dbt.fct_slippage_per_transaction as sl on sl.tx_hash = p.tx_hash
+        on ap.auction_id = p.auction_id
+       and ap.token = case when o.kind::text = 'sell' then o.buy_token else o.sell_token end
+    left join dbt.stg_auction_prices_corrections as apc
+        on apc.auction_id = ap.auction_id and apc.token = ap.token
+    -- slippage is keyed per (auction_id, tx_hash); join on both so a tx that batches
+    -- multiple auctions does not fan out / mis-attach the per-batch slippage.
+    left join dbt.fct_slippage_per_transaction as sl
+        on sl.tx_hash = p.tx_hash and sl.auction_id = p.auction_id
 )
 
 select
@@ -180,8 +195,12 @@ select
     executed_buy,
     limit_sell_amount,
     limit_buy_amount,
-    -- order size in native-token wei (works for settled and not-settled attempts)
-    executed_sell * sell_token_native_price / 1e18          as volume_native,
+    -- order size in native-token wei, valued on the surplus side (buy amount for sell
+    -- orders, sell amount for buy orders); present for settled and not-settled attempts.
+    case
+        when kind::text = 'sell' then executed_buy  * surplus_token_native_price / 1e18
+        when kind::text = 'buy'  then executed_sell * surplus_token_native_price / 1e18
+    end                                                     as volume_native,
     -- slippage tolerance: signed limit vs *effective* (corrected) quote price, in bps
     case
         when kind::text = 'sell' and effective_buy_amount > 0
@@ -189,7 +208,6 @@ select
         when kind::text = 'buy' and effective_sell_amount > 0
             then (limit_sell_amount - effective_sell_amount) / effective_sell_amount * 10000
     end                                                     as slippage_tolerance_bps,
-    calculated_slippage_bps,
     smart_slippage,
     -- realized solver slippage on the settlement tx (null for not-settled)
     slippage_native,

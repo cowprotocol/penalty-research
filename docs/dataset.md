@@ -37,7 +37,8 @@ Join key: **`(order_uid, tx_hash)`** — attaches Dune values only to the row th
     adjusted) creation quote price meets the limit price. `is_out_of_market` is its negation
     (true = effective quote fails the limit). We compute **only** that condition (not verified /
     not-excluded / quoter-bid / CIP-72); the full quote-reward flag is carried separately as
-    informational `is_quote_reward_eligible`. `is_out_of_market = (slippage_tolerance_bps < 0)`.
+    informational `is_quote_reward_eligible`. It is null only when the order has no quote, and
+    agrees with `slippage_tolerance_bps < 0` whenever the effective quote amount is positive.
   - **`partially_fillable`** (bool): false = fill-or-kill. Partial-fill orders are included
     (Dune query 7755542 covers them too).
 - **Volume-fee correction** (differs from dbt): the effective quote applies the compounded
@@ -48,19 +49,20 @@ Join key: **`(order_uid, tx_hash)`** — attaches Dune values only to the row th
 ## Units convention
 
 All `*_native` columns are in the chain's **native-token wei** (1e18) — `volume_native`,
-`reward_penalty_native`, `reward_native`, `penalty_native`, `penalty_uncapped_native`,
-`penalty_cap_native`, `reward_cap_upper_native`, `slippage_native`, `execution_cost_native`.
+`reward_penalty_native`, `reward_penalty_uncapped_native`, `reward_native`, `penalty_native`,
+`penalty_uncapped_native`, `penalty_cap_native`, `reward_cap_upper_native`, `slippage_native`,
+`execution_cost_native`.
 This keeps ratios (e.g. penalty / volume for the variable-rate counterfactual) unitless.
 Divide by 1e18 for whole tokens.
 
-## Output columns (44)
+## Output columns (43)
 
 | Column(s) | Source | Notes |
 | --- | --- | --- |
 | `blockchain`, `environment` | CLI | e.g. `polygon`/`bnb`, `prod` |
 | `auction_id`, `order_uid` | DB | grain |
 | `settled` | DB | real settlement tx exists |
-| `is_excluded_from_penalties` | DB | auction excluded from penalties (e.g. protocol-side issue) |
+| `is_excluded_from_penalties` | DB | auction excluded from penalties: explicitly excluded, **or** `block_deadline` in a no-penalties block range (penalty floored to 0) |
 | `is_quote_reward_eligible` | DB | informational: full quote-reward eligibility (not a filter) |
 | `is_out_of_market` | DB | effective (corrected) quote fails the limit price; null if no quote |
 | `solver`, `solver_name` | DB | winning solver of the attempt |
@@ -68,21 +70,22 @@ Divide by 1e18 for whole tokens.
 | `sell_token`, `buy_token`, `kind` | DB | token pair + sell/buy |
 | `partially_fillable` | DB | false = fill-or-kill |
 | `executed_sell/buy`, `limit_sell/buy_amount` | DB | amounts (atoms); raw quote dropped (use `slippage_tolerance_bps`) |
-| `volume_native` | DB | order size in native wei (all attempts) — `executed_sell × auction native price` |
+| `volume_native` | DB | order size in native wei (all attempts), valued on the **surplus side** — buy amount × buy-token price for sells, sell amount × sell-token price for buys; uses the **corrected** auction price |
 | `order_size_usd` | Dune | USD order size; **settled only** |
-| `slippage_tolerance_bps` | DB | signed limit-vs-**effective** (gas + volume-fee corrected) quote tolerance; all rows |
-| `calculated_slippage_bps`, `smart_slippage` | DB | realized slippage + smart-slippage flag |
-| `slippage_native`, `slippage_usd` | DB | solver execution slippage on the tx (`fct_slippage_per_transaction`); settled only |
+| `slippage_tolerance_bps` | DB | signed limit-vs-**effective** (gas + volume-fee corrected) quote tolerance; null if no quote |
+| `smart_slippage` | DB | smart-slippage flag (happy-moo SLI; see coverage caveat) |
+| `slippage_native`, `slippage_usd` | DB | realized solver execution slippage **per settlement tx** (`fct_slippage_per_transaction`); repeated across the tx's orders; settled only |
 | `execution_cost_native` | Dune | settlement gas cost (native wei), per tx; settled only |
 | `markout_usd`, `markout_relative` | Dune | settled only; null for feed-less tokens |
 | `reward_penalty_native` | DB | **profit/loss** = capped reward (`batch_reward_native`); signed, neg = penalty |
 | `reward_penalty_uncapped_native` | DB | pre-cap (`uncapped_reward`), signed |
 | `reward_native`, `penalty_native` | DB | the split (both ≥ 0): `reward = max(0,·)`, `penalty = max(0,−·)` |
 | `penalty_uncapped_native` | DB | uncapped penalty magnitude — for "realized penalties if uncapped" |
-| `penalty_cap_native`, `reward_cap_upper_native` | DB | `reward_config` caps (Polygon `c_l`=30 POL, BNB `c_l`=0.04 BNB) |
+| `penalty_cap_native` | DB | lower (penalty) cap from `reward_config` (Polygon `c_l`=30 POL, BNB `c_l`=0.04 BNB) |
+| `reward_cap_upper_native` | DB | the **binding** per-`(auction, solver)` upper reward cap actually applied (`fct_solver_rewards_per_auction.upper_reward_cap`, protocol-fee based) |
 | `reference_score`, `observed_score` | DB | scoring inputs |
 | `auction_timestamp`, `creation_timestamp`, `seconds_since_created` | DB | time since order created, per attempt |
-| `seconds_to_settle` | DB | happy-moo `order_duration` (time to the landed settlement) |
+| `seconds_to_settle` | DB | happy-moo `order_duration` (time to the landed settlement; see coverage caveat) |
 | `block_deadline`, `settlement_block` | DB | |
 
 Reward/penalty is `dbt.fct_solver_rewards_per_auction` per `(auction_id, solver)`, attached to
@@ -94,9 +97,18 @@ each of the solver's winning orders that auction (repeats for multi-order soluti
   stored; combine in the analysis.
 - **Reverts / fail-to-submit** have no Dune row → `order_size_usd`, `markout`,
   `execution_cost_native`, `slippage_*` are null; `volume_native` is still present (from
-  `auction_prices`). `executed_sell/buy` reflect the solver's *proposed* execution.
-- **Slippage coverage** ~90% of settled rows (`fct_slippage_per_transaction` doesn't cover
-  every tx).
+  `auction_prices`). `executed_sell/buy` reflect the solver's *proposed* execution (which
+  equals the realized fill for winners that execute).
+- **Dune enrichment is keyed on the settlement tx time**, not the auction window. The Dune
+  fetch is padded by `DUNE_WINDOW_BUFFER` (1 day) on each side so late / boundary settlements
+  still match; a settlement landing beyond that pad would leave its Dune columns null.
+- **Realized-slippage coverage** ~90% of settled rows (`fct_slippage_per_transaction` doesn't
+  cover every tx). `slippage_native/usd` is **per settlement tx**: summing across rows of the
+  *same* tx double-counts (summing across different txs is fine).
+- **Happy-moo coverage** (`smart_slippage`, `seconds_to_settle`): only orders that are
+  fill-or-kill, zero-`fee_amount`, and `orderClass='market'` app-data appear in
+  `fct_time_to_happy_moo__sli`; everything else is null (not dropped). Coverage can be well
+  below 100% for the limit-order population this dataset targets.
 - **Partial fills**: for `partially_fillable` orders the Dune `order_size_usd` / `markout_*`
   reflect the *filled portion* in that settlement tx, not the full order amount.
 - **Reward grain:** a `(auction, solver)` value repeated across the solver's orders in that
