@@ -19,7 +19,7 @@ select
     t.buy_value_usd                                                   as order_size_usd,
     t.buy_value_usd - t.sell_value_usd                               as markout_usd,
     (t.buy_value_usd - t.sell_value_usd) / nullif(t.sell_value_usd, 0) as markout_relative,
-    txn.gas_used * txn.gas_price                                      as execution_cost_native
+    cast(txn.gas_used as double) * cast(txn.gas_price as double)     as execution_cost_native
 from cow_protocol_{{blockchain}}.trades as t
 left join {{blockchain}}.transactions as txn
     on txn.hash = t.tx_hash
