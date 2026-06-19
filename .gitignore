@@ -19,6 +19,9 @@ env/
 .env.*
 !.env.example
 
+# Generated datasets
+data/
+
 # OS / editor
 .DS_Store
 .idea/

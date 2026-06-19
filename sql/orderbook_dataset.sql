@@ -1,0 +1,188 @@
+-- Penalties dataset spine, assembled from the dbt analytics layer + raw mirror
+-- in the cow-analytics-db database for one network/environment.
+--
+-- Grain: one row per (auction_id, order_uid) where the order was in that
+-- auction's WINNING solution (= one settlement attempt), restricted to
+-- in-market, fill-or-kill orders. Two outcomes: settled (a real tx hash) or
+-- not settled. We do NOT separate revert vs fail-to-submit, and do not special-
+-- case late settlements (kept simple).
+--
+-- {raw_schema} is interpolated (e.g. raw_prod_polygon). Bind params:
+--   %(start)s, %(end)s   auction-time window [start, end)
+--   %(network)s          reward_config network key (e.g. 'polygon')
+--   %(solver_env)s       solver-name environment ('prod' | 'barn')
+--
+-- IN-MARKET vs OUT-OF-MARKET: all orders are stored with class='limit'. The
+-- marketable subset is condition 1 of the quote-reward eligibility logic in
+-- cow-dagster's int_backend_data__orders_with_winning_quotes: the *effective*
+-- (gas + volume-fee adjusted) creation quote price meets the limit price. We
+-- replicate ONLY that condition (NOT verified / not-excluded / quoter-bid /
+-- CIP-72). The full flag is carried through as informational is_quote_reward_eligible.
+
+with wins as (
+    select
+        ws.auction_id,
+        ws.solution_uid,
+        ws.solver,
+        ws.block_deadline,
+        ws.block_number          as settlement_block,
+        ws.tx_hash,
+        pte.order_uid,
+        pte.executed_sell,
+        pte.executed_buy
+    from dbt.int_backend_data__winning_solutions_with_onchain_status as ws
+    join {raw_schema}.proposed_trade_executions as pte
+        on pte.auction_id = ws.auction_id
+       and pte.solution_uid = ws.solution_uid
+),
+
+windowed as (
+    select w.*, bt.time as auction_timestamp
+    from wins as w
+    join public.block_to_timestamp as bt on bt.block_number = w.block_deadline
+    where bt.time >= %(start)s and bt.time < %(end)s
+),
+
+priced as (  -- attach the per-(auction, solver) reward / penalty
+    select
+        windowed.*,
+        r.batch_reward_native    as reward_penalty_native,
+        r.uncapped_reward        as reward_penalty_uncapped_native,
+        r.is_excluded            as is_excluded_from_penalties,
+        r.reference_score,
+        r.observed_score
+    from windowed
+    left join dbt.fct_solver_rewards_per_auction as r
+        on r.auction_id = windowed.auction_id and r.solver = windowed.solver
+),
+
+-- one creation quote per order (stg_backend_data__order_quotes is unique on order_uid)
+order_quote as (
+    select order_uid, gas_amount, gas_price, sell_token_price, sell_amount, buy_amount
+    from dbt.stg_backend_data__order_quotes
+),
+
+-- volume fee per order (assumes one volume fee per order, as the dbt model does)
+volume_fee as (
+    select order_uid, max(coalesce(volume_factor, 0)) as volume_factor
+    from dbt.stg_backend_data__fee_policies
+    group by order_uid
+),
+
+enriched as (
+    select
+        p.auction_id,
+        p.order_uid,
+        p.solver,
+        p.tx_hash,
+        p.settlement_block,
+        p.block_deadline,
+        p.auction_timestamp,
+        p.executed_sell,
+        p.executed_buy,
+        p.reward_penalty_native,
+        p.reward_penalty_uncapped_native,
+        p.is_excluded_from_penalties,
+        p.reference_score,
+        p.observed_score,
+        o.kind,
+        o.partially_fillable,
+        o.creation_timestamp,
+        o.sell_token,
+        o.buy_token,
+        o.sell_amount                       as limit_sell_amount,
+        o.buy_amount                        as limit_buy_amount,
+        oq.sell_amount                      as quote_sell_amount,
+        oq.buy_amount                       as quote_buy_amount,
+        -- effective quote amounts (gas + volume-fee adjusted), per cow-dagster
+        case
+            when o.kind::text = 'buy'
+                then (oq.sell_amount + oq.gas_amount * oq.gas_price / nullif(oq.sell_token_price, 0))
+                     * (1 + coalesce(vf.volume_factor, 0))
+        end as effective_sell_amount,
+        case
+            when o.kind::text = 'sell'
+                then ((oq.sell_amount - oq.gas_amount * oq.gas_price / nullif(oq.sell_token_price, 0))
+                      * oq.buy_amount / nullif(oq.sell_amount, 0))
+                     * (1 - coalesce(vf.volume_factor, 0))
+        end as effective_buy_amount,
+        elig.is_eligible_for_quote_reward   as is_quote_reward_eligible,
+        hm.calculated_slippage_bps,
+        hm.smart_slippage,
+        hm.order_duration                   as seconds_to_settle,
+        sv.name                             as solver_name,
+        rc.batch_reward_cap_lower           as penalty_cap_native,
+        rc.batch_reward_cap_upper           as reward_cap_upper_native,
+        ap.price                            as sell_token_native_price,
+        sl.slippage_native,
+        sl.slippage_usd
+    from priced as p
+    join dbt.stg_backend_data__orders as o on o.uid = p.order_uid
+    left join order_quote as oq on oq.order_uid = p.order_uid
+    left join volume_fee as vf on vf.order_uid = p.order_uid
+    left join dbt.int_backend_data__orders_with_winning_quotes as elig on elig.order_uid = p.order_uid
+    left join dbt.fct_time_to_happy_moo__sli as hm on hm.uid = '0x' || encode(p.order_uid, 'hex')
+    left join dbt.dune_data__cow_protocol__solvers as sv
+        on sv.address = p.solver and sv.environment = %(solver_env)s
+    left join dbt.reward_config as rc on rc.network = %(network)s
+    left join {raw_schema}.auction_prices as ap
+        on ap.auction_id = p.auction_id and ap.token = o.sell_token
+    left join dbt.fct_slippage_per_transaction as sl on sl.tx_hash = p.tx_hash
+)
+
+select
+    auction_id,
+    '0x' || encode(order_uid, 'hex')                        as order_uid,
+    (tx_hash is not null)                                   as settled,
+    is_excluded_from_penalties,
+    is_quote_reward_eligible,                -- informational: full quote-reward eligibility
+    '0x' || encode(solver, 'hex')                           as solver,
+    solver_name,
+    case when tx_hash is not null then '0x' || encode(tx_hash, 'hex') end as tx_hash,
+    '0x' || encode(sell_token, 'hex')                       as sell_token,
+    '0x' || encode(buy_token, 'hex')                        as buy_token,
+    kind,
+    executed_sell,
+    executed_buy,
+    limit_sell_amount,
+    limit_buy_amount,
+    quote_sell_amount,
+    quote_buy_amount,
+    -- order size in native-token wei (works for settled and not-settled attempts)
+    executed_sell * sell_token_native_price / 1e18          as volume_native,
+    -- slippage tolerance: signed (raw) limit vs quote price, in bps
+    case
+        when kind::text = 'sell' and quote_buy_amount > 0
+            then (quote_buy_amount - limit_buy_amount) / quote_buy_amount * 10000
+        when kind::text = 'buy' and quote_sell_amount > 0
+            then (limit_sell_amount - quote_sell_amount) / quote_sell_amount * 10000
+    end                                                     as slippage_tolerance_bps,
+    calculated_slippage_bps,
+    smart_slippage,
+    -- realized solver slippage on the settlement tx (null for not-settled)
+    slippage_native,
+    slippage_usd,
+    -- reward / penalty (native token atoms). reward_penalty_native is signed
+    -- (negative = penalty); reward_native / penalty_native are the split (>= 0).
+    reward_penalty_native,
+    reward_penalty_uncapped_native,
+    greatest(0, reward_penalty_native)                      as reward_native,
+    greatest(0, -reward_penalty_native)                     as penalty_native,
+    greatest(0, -reward_penalty_uncapped_native)            as penalty_uncapped_native,
+    penalty_cap_native,
+    reward_cap_upper_native,
+    reference_score,
+    observed_score,
+    auction_timestamp,
+    creation_timestamp,
+    extract(epoch from (auction_timestamp - creation_timestamp)) as seconds_since_created,
+    seconds_to_settle,
+    block_deadline,
+    settlement_block
+from enriched
+where not partially_fillable
+  -- in-market: effective quote price meets the order's limit price (condition 1)
+  and (
+        (kind::text = 'sell' and effective_buy_amount >= limit_buy_amount)
+        or (kind::text = 'buy' and limit_sell_amount >= effective_sell_amount)
+  )

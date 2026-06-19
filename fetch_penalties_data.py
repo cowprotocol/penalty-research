@@ -1,0 +1,183 @@
+#!/usr/bin/env python
+"""Build the penalties dataset CSV for a (chain, time range).
+
+One row per auction x winning-solution order, in-market fill-or-kill orders only
+(see docs/dataset.md). Reverted winners are kept and flagged via `settled`.
+
+Sources:
+  * cow-analytics-db Postgres (ANALYTICS_DB_URL) -- the spine: dbt analytics
+    models + raw mirror. One database per network/environment (prod_<network>).
+  * Dune (DUNE_API_KEY, saved query 7755542) -- USD order size + markout,
+    joined on order_uid.
+
+Usage:
+    python fetch_penalties_data.py --chain polygon --start 2026-05-01 --end 2026-06-01 \
+        --out data/polygon_may.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from datetime import date, datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+import psycopg
+from dotenv import load_dotenv
+
+REPO = Path(__file__).resolve().parent
+DUNE_TRADE_MARKOUT_QUERY_ID = 7755542
+ORDERBOOK_SQL = (REPO / "sql" / "orderbook_dataset.sql").read_text()
+
+# chain -> names in each namespace. db_network forms the database (`<env>_<network>`)
+# and raw schema (`raw_<env>_<network>`); dune is the cow_protocol_<x>.trades schema;
+# reward_network keys dbt.reward_config / solver registry.
+CHAINS: dict[str, dict[str, str]] = {
+    "polygon":     {"dune": "polygon",     "db_network": "polygon",      "reward_network": "polygon"},
+    "bnb":         {"dune": "bnb",         "db_network": "bnb",          "reward_network": "bnb"},
+    # ready to extend:
+    "ethereum":    {"dune": "ethereum",    "db_network": "mainnet",      "reward_network": "mainnet"},
+    "gnosis":      {"dune": "gnosis",      "db_network": "xdai",         "reward_network": "gnosis"},
+    "arbitrum":    {"dune": "arbitrum",    "db_network": "arbitrum-one", "reward_network": "arbitrum"},
+    "base":        {"dune": "base",        "db_network": "base",         "reward_network": "base"},
+    "avalanche_c": {"dune": "avalanche_c", "db_network": "avalanche",    "reward_network": "avalanche"},
+}
+
+# Columns Dune contributes (joined on order_uid + tx_hash). Everything else is from the DB.
+DUNE_COLS = ["order_size_usd", "markout_usd", "markout_relative", "execution_cost_native"]
+
+
+# --- connection -------------------------------------------------------------
+
+def parse_endpoint(raw: str) -> dict:
+    """ANALYTICS_DB_URL is `user:pass@host:port` (no scheme, no db)."""
+    userinfo, hostinfo = raw.rsplit("@", 1)
+    user, password = userinfo.split(":", 1)
+    host, _, port = hostinfo.partition(":")
+    return {"host": host, "port": int(port or 5432), "user": user, "password": password}
+
+
+def db_names(chain: str, environment: str) -> tuple[str, str]:
+    """Return (database, raw_schema) for a chain + environment."""
+    net = CHAINS[chain]["db_network"]
+    return f"{environment}_{net}", f"raw_{environment}_{net}"
+
+
+# --- sources ----------------------------------------------------------------
+
+def fetch_orderbook(chain: str, start: datetime, end: datetime, environment: str) -> pd.DataFrame:
+    """Winning in-market FOK orders + reward/penalty + slippage + timing."""
+    raw_url = os.environ.get("ANALYTICS_DB_URL")
+    if not raw_url:
+        sys.exit("ANALYTICS_DB_URL is not set (see .env.example).")
+    database, raw_schema = db_names(chain, environment)
+    sql = ORDERBOOK_SQL.format(raw_schema=raw_schema)
+    params = {
+        "start": start,
+        "end": end,
+        "network": CHAINS[chain]["reward_network"],
+        "solver_env": "prod" if environment == "prod" else "barn",
+    }
+    conn_kwargs = parse_endpoint(raw_url)
+    with psycopg.connect(
+        dbname=database, connect_timeout=20, autocommit=True,
+        options="-c default_transaction_read_only=on -c statement_timeout=300000 -c timezone=UTC",
+        **conn_kwargs,
+    ) as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+        cols = [d.name for d in cur.description]
+        rows = cur.fetchall()
+    return pd.DataFrame(rows, columns=cols)
+
+
+def fetch_dune_trades(chain: str, start: datetime, end: datetime) -> pd.DataFrame:
+    """USD order size + markout per settled FOK trade, keyed by order_uid."""
+    from dune_client.client import DuneClient
+    from dune_client.query import QueryBase
+    from dune_client.types import QueryParameter
+
+    api_key = os.environ.get("DUNE_API_KEY")
+    if not api_key:
+        sys.exit("DUNE_API_KEY is not set (see .env.example).")
+    query = QueryBase(
+        query_id=DUNE_TRADE_MARKOUT_QUERY_ID,
+        params=[
+            QueryParameter.text_type("blockchain", CHAINS[chain]["dune"]),
+            QueryParameter.text_type("start_time", start.strftime("%Y-%m-%d %H:%M:%S")),
+            QueryParameter.text_type("end_time", end.strftime("%Y-%m-%d %H:%M:%S")),
+        ],
+    )
+    df = DuneClient(api_key, request_timeout=600).run_query_dataframe(query, performance="medium")
+    if not df.empty:
+        for col in ("order_uid", "tx_hash"):
+            df[col] = df[col].map(normalize_hex)
+    return df
+
+
+# --- assembly ---------------------------------------------------------------
+
+def normalize_hex(v) -> str | None:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    s = str(v).lower()
+    return s if s.startswith("0x") else "0x" + s
+
+
+def assemble(orderbook: pd.DataFrame, dune: pd.DataFrame) -> pd.DataFrame:
+    """Left-join Dune USD/markout onto the DB spine (keyed by order_uid)."""
+    orderbook["order_uid"] = orderbook["order_uid"].map(normalize_hex)
+    orderbook["tx_hash"] = orderbook["tx_hash"].map(normalize_hex)
+    if dune.empty:
+        for col in DUNE_COLS:
+            orderbook[col] = pd.NA
+        return orderbook
+    # Join on (order_uid, tx_hash): attaches markout only to the row that actually
+    # settled, so a revert that later settles elsewhere doesn't inherit its markout.
+    right = dune[["order_uid", "tx_hash", *DUNE_COLS]].drop_duplicates(["order_uid", "tx_hash"])
+    return orderbook.merge(right, on=["order_uid", "tx_hash"], how="left")
+
+
+# --- CLI --------------------------------------------------------------------
+
+def parse_day(s: str) -> datetime:
+    return datetime.combine(date.fromisoformat(s), datetime.min.time(), tzinfo=timezone.utc)
+
+
+def main() -> None:
+    load_dotenv(REPO / ".env")
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--chain", required=True, choices=sorted(CHAINS))
+    p.add_argument("--start", required=True, type=parse_day, help="inclusive, YYYY-MM-DD (UTC)")
+    p.add_argument("--end", required=True, type=parse_day, help="exclusive, YYYY-MM-DD (UTC)")
+    p.add_argument("--out", required=True, help="output CSV path")
+    p.add_argument("--environment", default="prod", choices=("prod", "staging"),
+                   help="prod (default) or staging (= barn)")
+    args = p.parse_args()
+    if args.end <= args.start:
+        sys.exit("--end must be after --start")
+
+    print(f"[db]   {args.environment}_{CHAINS[args.chain]['db_network']} "
+          f"{args.start:%Y-%m-%d}..{args.end:%Y-%m-%d}", file=sys.stderr)
+    orderbook = fetch_orderbook(args.chain, args.start, args.end, args.environment)
+    print(f"[db]   {len(orderbook)} winning in-market FOK orders "
+          f"({int(orderbook['settled'].eq(False).sum())} reverted)", file=sys.stderr)
+
+    print(f"[dune] fetching {CHAINS[args.chain]['dune']} trades", file=sys.stderr)
+    dune = fetch_dune_trades(args.chain, args.start, args.end)
+    print(f"[dune] {len(dune)} FOK trades", file=sys.stderr)
+
+    result = assemble(orderbook, dune)
+    result.insert(0, "blockchain", args.chain)
+    result.insert(1, "environment", args.environment)
+    matched = int(result["markout_usd"].notna().sum()) if "markout_usd" in result else 0
+    print(f"[join] {matched}/{len(result)} rows enriched with Dune markout", file=sys.stderr)
+
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    result.to_csv(args.out, index=False)
+    print(f"[out]  wrote {len(result)} rows -> {args.out}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
