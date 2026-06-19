@@ -1,7 +1,7 @@
 FROM mcr.microsoft.com/devcontainers/base:bookworm
 
 # Bring in the uv / uvx binaries from the official image (pinned for reproducibility).
-COPY --from=ghcr.io/astral-sh/uv:0.5.26 /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.11.22 /uv /uvx /usr/local/bin/
 
 # copy   = play nice with the bind-mounted workspace (no hardlinks across filesystems)
 # 1      = pre-compile to .pyc for faster first import
