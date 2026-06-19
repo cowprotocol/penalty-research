@@ -11,8 +11,8 @@ Sources:
     joined on order_uid.
 
 Usage:
-    python fetch_penalties_data.py --chain polygon --start 2026-05-01 --end 2026-06-01 \
-        --out data/polygon_may.csv
+    python scripts/fetch_penalties_data.py --chain polygon --start 2026-05-01 --end 2026-06-01
+    # writes data/polygon_2026-05-01_2026-06-01.csv by default; override with --out
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ import pandas as pd
 import psycopg
 from dotenv import load_dotenv
 
-REPO = Path(__file__).resolve().parent
+REPO = Path(__file__).resolve().parent.parent
 DUNE_TRADE_MARKOUT_QUERY_ID = 7755542
 ORDERBOOK_SQL = (REPO / "sql" / "orderbook_dataset.sql").read_text()
 
@@ -151,12 +151,15 @@ def main() -> None:
     p.add_argument("--chain", required=True, choices=sorted(CHAINS))
     p.add_argument("--start", required=True, type=parse_day, help="inclusive, YYYY-MM-DD (UTC)")
     p.add_argument("--end", required=True, type=parse_day, help="exclusive, YYYY-MM-DD (UTC)")
-    p.add_argument("--out", required=True, help="output CSV path")
+    p.add_argument("--out", default=None,
+                   help="output CSV path (default: data/{chain}_{start}_{end}.csv)")
     p.add_argument("--environment", default="prod", choices=("prod", "staging"),
                    help="prod (default) or staging (= barn)")
     args = p.parse_args()
     if args.end <= args.start:
         sys.exit("--end must be after --start")
+    out = Path(args.out) if args.out else (
+        REPO / "data" / f"{args.chain}_{args.start:%Y-%m-%d}_{args.end:%Y-%m-%d}.csv")
 
     print(f"[db]   {args.environment}_{CHAINS[args.chain]['db_network']} "
           f"{args.start:%Y-%m-%d}..{args.end:%Y-%m-%d}", file=sys.stderr)
@@ -174,9 +177,9 @@ def main() -> None:
     matched = int(result["markout_usd"].notna().sum()) if "markout_usd" in result else 0
     print(f"[join] {matched}/{len(result)} rows enriched with Dune markout", file=sys.stderr)
 
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    result.to_csv(args.out, index=False)
-    print(f"[out]  wrote {len(result)} rows -> {args.out}", file=sys.stderr)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    result.to_csv(out, index=False)
+    print(f"[out]  wrote {len(result)} rows -> {out}", file=sys.stderr)
 
 
 if __name__ == "__main__":

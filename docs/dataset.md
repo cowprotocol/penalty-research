@@ -1,12 +1,12 @@
 # Penalties dataset — design
 
-`fetch_penalties_data.py` builds a CSV for the *Rethinking Penalties* analysis:
+`scripts/fetch_penalties_data.py` builds a CSV for the *Rethinking Penalties* analysis:
 **one row per (auction_id, order_uid) settlement attempt**, in-market fill-or-kill
 orders only, for a `(chain, time range)`. Not-settled attempts are kept and flagged.
 
 ```bash
-uv run python fetch_penalties_data.py --chain polygon --start 2026-05-01 --end 2026-06-01 \
-    --out data/polygon_may.csv
+uv run python scripts/fetch_penalties_data.py --chain polygon --start 2026-05-01 --end 2026-06-01
+# writes data/polygon_2026-05-01_2026-06-01.csv by default; override with --out
 # --environment prod (default) | staging   (staging = barn)
 ```
 
@@ -92,7 +92,7 @@ each of the solver's winning orders that auction (repeats for multi-order soluti
 ## Extending
 
 - **staging / barn:** `--environment staging` (database `staging_<network>`).
-- **other chains:** add to `CHAINS` in `fetch_penalties_data.py` (dune name, db_network,
+- **other chains:** add to `CHAINS` in `scripts/fetch_penalties_data.py` (dune name, db_network,
   reward_network — e.g. ethereum→mainnet, gnosis→xdai, arbitrum→arbitrum-one).
 
 ## Introspection helpers (`scripts/`)
