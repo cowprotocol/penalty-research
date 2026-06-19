@@ -67,7 +67,8 @@ def db_names(chain: str, environment: str) -> tuple[str, str]:
 
 # --- sources ----------------------------------------------------------------
 
-def fetch_orderbook(chain: str, start: datetime, end: datetime, environment: str) -> pd.DataFrame:
+def fetch_orderbook(chain: str, start: datetime, end: datetime, environment: str,
+                    timeout_s: int = 900) -> pd.DataFrame:
     """Winning in-market FOK orders + reward/penalty + slippage + timing."""
     raw_url = os.environ.get("ANALYTICS_DB_URL")
     if not raw_url:
@@ -83,10 +84,14 @@ def fetch_orderbook(chain: str, start: datetime, end: datetime, environment: str
     conn_kwargs = parse_endpoint(raw_url)
     with psycopg.connect(
         dbname=database, connect_timeout=20, autocommit=True,
-        options="-c default_transaction_read_only=on -c statement_timeout=300000 -c timezone=UTC",
+        options=f"-c default_transaction_read_only=on -c statement_timeout={timeout_s * 1000} -c timezone=UTC",
         **conn_kwargs,
     ) as conn, conn.cursor() as cur:
-        cur.execute(sql, params)
+        try:
+            cur.execute(sql, params)
+        except psycopg.errors.QueryCanceled:
+            sys.exit(f"[db]   query exceeded --db-timeout ({timeout_s}s). "
+                     "Narrow the --start/--end window or raise --db-timeout.")
         cols = [d.name for d in cur.description]
         rows = cur.fetchall()
     return pd.DataFrame(rows, columns=cols)
@@ -155,6 +160,8 @@ def main() -> None:
                    help="output CSV path (default: data/{chain}_{start}_{end}.csv)")
     p.add_argument("--environment", default="prod", choices=("prod", "staging"),
                    help="prod (default) or staging (= barn)")
+    p.add_argument("--db-timeout", type=int, default=900, metavar="SECONDS",
+                   help="Postgres statement_timeout in seconds (default: 900)")
     args = p.parse_args()
     if args.end <= args.start:
         sys.exit("--end must be after --start")
@@ -163,7 +170,7 @@ def main() -> None:
 
     print(f"[db]   {args.environment}_{CHAINS[args.chain]['db_network']} "
           f"{args.start:%Y-%m-%d}..{args.end:%Y-%m-%d}", file=sys.stderr)
-    orderbook = fetch_orderbook(args.chain, args.start, args.end, args.environment)
+    orderbook = fetch_orderbook(args.chain, args.start, args.end, args.environment, args.db_timeout)
     print(f"[db]   {len(orderbook)} winning in-market FOK orders "
           f"({int(orderbook['settled'].eq(False).sum())} reverted)", file=sys.stderr)
 

@@ -8,6 +8,7 @@ orders only, for a `(chain, time range)`. Not-settled attempts are kept and flag
 uv run python scripts/fetch_penalties_data.py --chain polygon --start 2026-05-01 --end 2026-06-01
 # writes data/polygon_2026-05-01_2026-06-01.csv by default; override with --out
 # --environment prod (default) | staging   (staging = barn)
+# --db-timeout 900   Postgres statement_timeout in seconds (raise for very large windows)
 ```
 
 ## Sources

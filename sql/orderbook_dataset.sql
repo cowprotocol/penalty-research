@@ -19,7 +19,23 @@
 -- replicate ONLY that condition (NOT verified / not-excluded / quoter-bid /
 -- CIP-72). The full flag is carried through as informational is_quote_reward_eligible.
 
-with wins as (
+-- PERF: map the auction-time window to a block-number range up front so we can
+-- prune winning_solutions by block_deadline BEFORE the heavy joins. Without this,
+-- the planner builds the full-history join first and timestamps every historical
+-- winner with a per-row probe into the 476 MB block_to_timestamp table, applying
+-- the date filter dead last (~20s for a 1-day window; the work scales with all
+-- history, not the window). The `+ 0` defeats Postgres's index min/max shortcut,
+-- which otherwise walks the pkey from the chain tip back to the window; a single
+-- sequential aggregate pass is cheaper and window-position-independent. The exact
+-- bt.time filter in `windowed` stays authoritative -- block_window is only a
+-- (monotonic block<->time) bracket, so results are unchanged.
+with block_window as materialized (
+    select min(block_number + 0) as lo, max(block_number + 0) as hi
+    from public.block_to_timestamp
+    where time >= %(start)s and time < %(end)s
+),
+
+windowed as (
     select
         ws.auction_id,
         ws.solution_uid,
@@ -29,18 +45,17 @@ with wins as (
         ws.tx_hash,
         pte.order_uid,
         pte.executed_sell,
-        pte.executed_buy
-    from dbt.int_backend_data__winning_solutions_with_onchain_status as ws
+        pte.executed_buy,
+        bt.time                  as auction_timestamp
+    from block_window as bw
+    join dbt.int_backend_data__winning_solutions_with_onchain_status as ws
+        on ws.block_deadline between bw.lo and bw.hi
+    join public.block_to_timestamp as bt
+        on bt.block_number = ws.block_deadline
+       and bt.time >= %(start)s and bt.time < %(end)s
     join {raw_schema}.proposed_trade_executions as pte
         on pte.auction_id = ws.auction_id
        and pte.solution_uid = ws.solution_uid
-),
-
-windowed as (
-    select w.*, bt.time as auction_timestamp
-    from wins as w
-    join public.block_to_timestamp as bt on bt.block_number = w.block_deadline
-    where bt.time >= %(start)s and bt.time < %(end)s
 ),
 
 priced as (  -- attach the per-(auction, solver) reward / penalty
