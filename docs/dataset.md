@@ -15,8 +15,8 @@ uv run python scripts/fetch_penalties_data.py --chain polygon --start 2026-05-01
 ## Sources
 
 - **cow-analytics-db** (`ANALYTICS_DB_URL`) — the spine. One database per network/env
-  (`prod_<network>`); the query reads **only** the `dbt` analytics layer (staging + marts),
-  so numbers match the official accounting. (dbt staging can lag the raw replication by the
+  (`prod_<network>`); the query reads **only** the `dbt` analytics layer (staging, marts, and
+  config seeds), so numbers match the official accounting. (dbt staging can lag the raw replication by the
   build cadence, so the most recent minutes of a window may be incomplete — irrelevant for
   historical research ranges.)
 - **Dune** (`DUNE_API_KEY`, query [7755542](https://dune.com/queries/7755542)) — USD order
@@ -72,7 +72,7 @@ Divide by 1e18 for whole tokens.
 | `partially_fillable` | DB | false = fill-or-kill |
 | `executed_sell/buy`, `limit_sell/buy_amount` | DB | amounts (atoms); raw quote dropped (use `slippage_tolerance_bps`) |
 | `volume_native` | DB | order size in native wei (all attempts), valued on the **surplus side** — buy amount × buy-token price for sells, sell amount × sell-token price for buys; uses the **corrected** auction price |
-| `order_size_usd` | Dune | USD order size; **settled only** |
+| `order_size_usd` | Dune | USD order size; **settled only**; null for feed-less tokens |
 | `slippage_tolerance_bps` | DB | signed limit-vs-**effective** (gas + volume-fee corrected) quote tolerance; null if no quote |
 | `smart_slippage` | DB | smart-slippage flag (happy-moo SLI; see coverage caveat) |
 | `slippage_native`, `slippage_usd` | DB | realized solver execution slippage **per settlement tx** (`fct_slippage_per_transaction`); repeated across the tx's orders; settled only |

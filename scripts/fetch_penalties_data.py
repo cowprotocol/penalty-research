@@ -6,10 +6,10 @@ partially_fillable / is_out_of_market carried as flags (see docs/dataset.md).
 Reverted winners are kept and flagged via `settled`.
 
 Sources:
-  * cow-analytics-db Postgres (ANALYTICS_DB_URL) -- the spine: dbt analytics
-    models + raw mirror. One database per network/environment (prod_<network>).
-  * Dune (DUNE_API_KEY, saved query 7755542) -- USD order size + markout,
-    joined on (order_uid, tx_hash).
+  * cow-analytics-db Postgres (ANALYTICS_DB_URL) -- the spine: the dbt analytics
+    layer only. One database per network/environment (prod_<network>).
+  * Dune (DUNE_API_KEY, saved query 7755542) -- USD order size + markout +
+    settlement gas cost, joined on (order_uid, tx_hash).
 
 Usage:
     python scripts/fetch_penalties_data.py --chain polygon --start 2026-05-01 --end 2026-06-01
@@ -32,9 +32,9 @@ REPO = Path(__file__).resolve().parent.parent
 DUNE_TRADE_MARKOUT_QUERY_ID = 7755542
 ORDERBOOK_SQL = (REPO / "sql" / "orderbook_dataset.sql").read_text()
 
-# chain -> names in each namespace. db_network forms the database (`<env>_<network>`)
-# and raw schema (`raw_<env>_<network>`); dune is the cow_protocol_<x>.trades schema;
-# reward_network keys dbt.reward_config / solver registry.
+# chain -> names in each namespace. db_network forms the database (`<env>_<network>`);
+# dune is the cow_protocol_<x>.trades schema; reward_network keys dbt.reward_config /
+# the solver registry.
 CHAINS: dict[str, dict[str, str]] = {
     "polygon":     {"dune": "polygon",     "db_network": "polygon",      "reward_network": "polygon"},
     "bnb":         {"dune": "bnb",         "db_network": "bnb",          "reward_network": "bnb"},
@@ -181,13 +181,15 @@ def main() -> None:
     print(f"[dune] fetching {CHAINS[args.chain]['dune']} trades", file=sys.stderr)
     # widen the Dune window so late / boundary settlements still match (see DUNE_WINDOW_BUFFER)
     dune = fetch_dune_trades(args.chain, args.start - DUNE_WINDOW_BUFFER, args.end + DUNE_WINDOW_BUFFER)
-    print(f"[dune] {len(dune)} FOK trades", file=sys.stderr)
+    print(f"[dune] {len(dune)} trades", file=sys.stderr)
 
     result = assemble(orderbook, dune)
     result.insert(0, "blockchain", args.chain)
     result.insert(1, "environment", args.environment)
-    matched = int(result["markout_usd"].notna().sum()) if "markout_usd" in result else 0
-    print(f"[join] {matched}/{len(result)} rows enriched with Dune markout", file=sys.stderr)
+    # count via execution_cost_native: it's present on every matched Dune row, whereas
+    # markout/order_size are null for feed-less tokens and would undercount the join rate.
+    matched = int(result["execution_cost_native"].notna().sum()) if "execution_cost_native" in result else 0
+    print(f"[join] {matched}/{len(result)} rows matched to a Dune trade", file=sys.stderr)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(out, index=False)

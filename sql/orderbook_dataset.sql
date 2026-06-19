@@ -83,7 +83,9 @@ order_quote as (
 -- max(volume_factor) of a single fee), we compound ALL volume fees that apply in
 -- the FIRST auction the order carries them in: multiplier = prod(1 - factor_i).
 -- Most orders carry two volume fees (e.g. protocol + partner), so max() understates
--- the true take. prod() via exp(sum(ln(...))) -- factors are small (<= 0.01), so safe.
+-- the true take. prod() via exp(sum(ln(...))). Factors are protocol-configured well
+-- under 1; a factor >= 1 is corrupt data, and we let ln() raise (aborting the run)
+-- rather than silently mask it.
 volume_fee as (
     select order_uid, exp(sum(ln(1 - volume_factor))) as volume_multiplier
     from (
@@ -157,6 +159,8 @@ enriched as (
     left join dbt.fct_time_to_happy_moo__sli as hm on hm.uid = '0x' || encode(p.order_uid, 'hex')
     left join dbt.dune_data__cow_protocol__solvers as sv
         on sv.address = p.solver and sv.environment = %(solver_env)s
+    -- reward_config is the raw config seed (read directly; stg_reward_config only adds the
+    -- network filter this join already applies). penalty_cap_native is its lower cap.
     left join dbt.reward_config as rc on rc.network = %(network)s
     -- value the order on its SURPLUS side: buy token for sell orders, sell token for buy
     -- orders. That token's auction native price is always present. The corrected price
