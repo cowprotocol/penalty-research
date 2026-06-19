@@ -15,9 +15,10 @@ uv run python scripts/fetch_penalties_data.py --chain polygon --start 2026-05-01
 ## Sources
 
 - **cow-analytics-db** (`ANALYTICS_DB_URL`) — the spine. One database per network/env
-  (`prod_<network>`), each with a `dbt` analytics layer, a `raw_<env>_<network>`
-  replication mirror, and a `public` backend copy. We lean on dbt models so numbers match
-  the official accounting; see `scripts/db_overview.py` for the full map.
+  (`prod_<network>`); the query reads **only** the `dbt` analytics layer (staging + marts),
+  so numbers match the official accounting. (dbt staging can lag the raw replication by the
+  build cadence, so the most recent minutes of a window may be incomplete — irrelevant for
+  historical research ranges.)
 - **Dune** (`DUNE_API_KEY`, query [7755542](https://dune.com/queries/7755542)) — USD order
   size + markout (`cow_protocol_<chain>.trades`) and settlement gas cost (`<chain>.transactions`).
 
@@ -119,8 +120,3 @@ each of the solver's winning orders that auction (repeats for multi-order soluti
 - **staging / barn:** `--environment staging` (database `staging_<network>`).
 - **other chains:** add to `CHAINS` in `scripts/fetch_penalties_data.py` (dune name, db_network,
   reward_network — e.g. ethereum→mainnet, gnosis→xdai, arbitrum→arbitrum-one).
-
-## Introspection helpers (`scripts/`)
-
-`db_overview.py`, `db_target_detail.py`, `db_model_columns.py`, `db_find_inmarket.py`,
-`db_grain_check.py`.

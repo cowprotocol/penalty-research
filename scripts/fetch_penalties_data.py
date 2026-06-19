@@ -65,10 +65,9 @@ def parse_endpoint(raw: str) -> dict:
     return {"host": host, "port": int(port or 5432), "user": user, "password": password}
 
 
-def db_names(chain: str, environment: str) -> tuple[str, str]:
-    """Return (database, raw_schema) for a chain + environment."""
-    net = CHAINS[chain]["db_network"]
-    return f"{environment}_{net}", f"raw_{environment}_{net}"
+def db_name(chain: str, environment: str) -> str:
+    """Return the Postgres database name (`<env>_<network>`) for a chain + environment."""
+    return f"{environment}_{CHAINS[chain]['db_network']}"
 
 
 # --- sources ----------------------------------------------------------------
@@ -79,8 +78,7 @@ def fetch_orderbook(chain: str, start: datetime, end: datetime, environment: str
     raw_url = os.environ.get("ANALYTICS_DB_URL")
     if not raw_url:
         sys.exit("ANALYTICS_DB_URL is not set (see .env.example).")
-    database, raw_schema = db_names(chain, environment)
-    sql = ORDERBOOK_SQL.format(raw_schema=raw_schema)
+    database = db_name(chain, environment)
     params = {
         "start": start,
         "end": end,
@@ -94,7 +92,7 @@ def fetch_orderbook(chain: str, start: datetime, end: datetime, environment: str
         **conn_kwargs,
     ) as conn, conn.cursor() as cur:
         try:
-            cur.execute(sql, params)
+            cur.execute(ORDERBOOK_SQL, params)
         except psycopg.errors.QueryCanceled:
             sys.exit(f"[db]   query exceeded --db-timeout ({timeout_s}s). "
                      "Narrow the --start/--end window or raise --db-timeout.")

@@ -1,4 +1,4 @@
--- Penalties dataset spine, assembled from the dbt analytics layer + raw mirror
+-- Penalties dataset spine, assembled entirely from the dbt analytics layer
 -- in the cow-analytics-db database for one network/environment.
 --
 -- Grain: one row per (auction_id, order_uid) where the order was in that
@@ -7,7 +7,7 @@
 -- Two outcomes: settled (a real tx hash) or not settled. We do NOT separate
 -- revert vs fail-to-submit, and do not special-case late settlements (kept simple).
 --
--- {raw_schema} is interpolated (e.g. raw_prod_polygon). Bind params:
+-- Bind params:
 --   %(start)s, %(end)s   auction-time window [start, end)
 --   %(network)s          reward_config network key (e.g. 'polygon')
 --   %(solver_env)s       solver-name environment ('prod' | 'barn')
@@ -23,7 +23,7 @@
 -- PERF: map the auction-time window to a block-number range up front so we can
 -- prune winning_solutions by block_deadline BEFORE the heavy joins. Without this,
 -- the planner builds the full-history join first and timestamps every historical
--- winner with a per-row probe into the 476 MB block_to_timestamp table, applying
+-- winner with a per-row probe into the large block-timestamp table, applying
 -- the date filter dead last (~20s for a 1-day window; the work scales with all
 -- history, not the window). The `+ 0` defeats Postgres's index min/max shortcut,
 -- which otherwise walks the pkey from the chain tip back to the window; a single
@@ -32,7 +32,7 @@
 -- (monotonic block<->time) bracket, so results are unchanged.
 with block_window as materialized (
     select min(block_number + 0) as lo, max(block_number + 0) as hi
-    from public.block_to_timestamp
+    from dbt.stg_rpc_data__block_timestamp
     where time >= %(start)s and time < %(end)s
 ),
 
@@ -51,10 +51,10 @@ windowed as (
     from block_window as bw
     join dbt.int_backend_data__winning_solutions_with_onchain_status as ws
         on ws.block_deadline between bw.lo and bw.hi
-    join public.block_to_timestamp as bt
+    join dbt.stg_rpc_data__block_timestamp as bt
         on bt.block_number = ws.block_deadline
        and bt.time >= %(start)s and bt.time < %(end)s
-    join {raw_schema}.proposed_trade_executions as pte
+    join dbt.stg_backend_data__proposed_trade_executions as pte
         on pte.auction_id = ws.auction_id
        and pte.solution_uid = ws.solution_uid
 ),
@@ -161,7 +161,7 @@ enriched as (
     -- value the order on its SURPLUS side: buy token for sell orders, sell token for buy
     -- orders. That token's auction native price is always present. The corrected price
     -- (stg_auction_prices_corrections) overrides the raw auction price, matching dbt.
-    left join {raw_schema}.auction_prices as ap
+    left join dbt.stg_backend_data__auction_prices as ap
         on ap.auction_id = p.auction_id
        and ap.token = case when o.kind::text = 'sell' then o.buy_token else o.sell_token end
     left join dbt.stg_auction_prices_corrections as apc
