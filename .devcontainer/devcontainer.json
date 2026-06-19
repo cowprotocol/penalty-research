@@ -1,0 +1,30 @@
+{
+  "name": "penalty-research",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  // Sync the environment from the lockfile, then wire up nbstripout's git filters
+  // for this clone (the filter config lives in .git/config, which is not committed).
+  "postCreateCommand": "uv sync && uv run nbstripout --install",
+  "forwardPorts": [8888],
+  "portsAttributes": {
+    "8888": {
+      "label": "JupyterLab",
+      "onAutoForward": "notify"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "charliermarsh.ruff"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/workspaces/penalty-research/.venv/bin/python",
+        "python.terminal.activateEnvironment": false
+      }
+    }
+  }
+}

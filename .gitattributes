@@ -1,0 +1,5 @@
+# Strip notebook outputs/metadata on commit via nbstripout.
+# The git filters themselves are wired up by `nbstripout --install`
+# (run automatically in the devcontainer; see README for manual setup).
+*.ipynb filter=nbstripout
+*.ipynb diff=ipynb

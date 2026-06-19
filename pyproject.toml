@@ -1,0 +1,14 @@
+[project]
+name = "penalty-research"
+version = "0.1.0"
+description = "Analysis notebooks"
+requires-python = ">=3.14"
+dependencies = [
+    "ipykernel>=6.29",
+    "jupyterlab>=4.2",
+    "nbstripout>=0.7",
+]
+
+[tool.uv]
+# This project is an environment for notebooks, not an installable package.
+package = false
