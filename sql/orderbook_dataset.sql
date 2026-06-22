@@ -20,23 +20,17 @@
 -- other condition (NOT verified / not-excluded / quoter-bid / CIP-72). The full
 -- quote-reward flag is carried through as informational is_quote_reward_eligible.
 
--- PERF: map the auction-time window to a block-number range up front so we can
--- prune winning_solutions by block_deadline BEFORE the heavy joins. Without this,
--- the planner builds the full-history join first and timestamps every historical
--- winner with a per-row probe into the large block-timestamp table, applying
--- the date filter dead last (~20s for a 1-day window; the work scales with all
--- history, not the window). The `+ 0` defeats Postgres's index min/max shortcut,
--- which otherwise walks the pkey from the chain tip back to the window; a single
--- sequential aggregate pass is cheaper and window-position-independent. The exact
--- bt.time filter in `windowed` stays authoritative -- block_window is only a
--- (monotonic block<->time) bracket, so results are unchanged.
-with block_window as materialized (
-    select min(block_number + 0) as lo, max(block_number + 0) as hi
-    from dbt.stg_rpc_data__block_timestamp
-    where time >= %(start)s and time < %(end)s
-),
-
-windowed as (
+-- PERF: prune winning_solutions by block_deadline up front, using a block-number range that
+-- the caller (fetch_penalties_data.py) derives from the auction-time window and passes as
+-- %(block_lo)s / %(block_hi)s. The bounds are literal values the planner can estimate range
+-- selectivity from. Deriving them inline instead -- a min/max over the block-timestamp table
+-- in a CTE -- makes their value opaque to the planner: it falls back to a generic range guess,
+-- under-counts the windowed rows by ~10x, and freezes the whole query into per-row nested-loop
+-- index probes (fine for a 1-day window, pathological for months -- e.g. ~150k random probes
+-- into the 2 GB auction-prices table). With real bounds the planner instead flips to bulk hash
+-- joins as the window grows. The exact bt.time filter below stays authoritative -- block_lo/hi
+-- are only a (monotonic block<->time) bracket, so results are unchanged.
+with windowed as (
     select
         ws.auction_id,
         ws.solution_uid,
@@ -48,15 +42,14 @@ windowed as (
         pte.executed_sell,
         pte.executed_buy,
         bt.time                  as auction_timestamp
-    from block_window as bw
-    join dbt.int_backend_data__winning_solutions_with_onchain_status as ws
-        on ws.block_deadline between bw.lo and bw.hi
+    from dbt.int_backend_data__winning_solutions_with_onchain_status as ws
     join dbt.stg_rpc_data__block_timestamp as bt
         on bt.block_number = ws.block_deadline
        and bt.time >= %(start)s and bt.time < %(end)s
     join dbt.stg_backend_data__proposed_trade_executions as pte
         on pte.auction_id = ws.auction_id
        and pte.solution_uid = ws.solution_uid
+    where ws.block_deadline between %(block_lo)s and %(block_hi)s
 ),
 
 priced as (  -- attach the per-(auction, solver) reward / penalty
@@ -86,6 +79,10 @@ order_quote as (
 -- the true take. prod() via exp(sum(ln(...))). Factors are protocol-configured well
 -- under 1; a factor >= 1 is corrupt data, and we let ln() raise (aborting the run)
 -- rather than silently mask it.
+-- PERF: restrict to orders in this window. fee_policies has no order_uid-leading index, so the
+-- table is still scanned, but the disk-spilling sort + window + group-by then runs over only the
+-- windowed orders instead of every order in history (the partition still sees all of a kept
+-- order's auctions, so first_auction is unchanged).
 volume_fee as (
     select order_uid, exp(sum(ln(1 - volume_factor))) as volume_multiplier
     from (
@@ -93,9 +90,30 @@ volume_fee as (
                min(auction_id) over (partition by order_uid) as first_auction
         from dbt.stg_backend_data__fee_policies
         where kind::text = 'volume'
+          and order_uid in (select order_uid from windowed)
     ) v
     where auction_id = first_auction
     group by order_uid
+),
+
+-- Raw surplus-side native price (= auction price / 1e18; native atoms per surplus-token atom)
+-- for NOT-settled attempts only. Settled attempts read it from int_backend_data__price_data
+-- below, which is keyed and indexed on (auction_id, order_uid); they have a trade so they are
+-- present there and never reach this CTE -- gating on tx_hash is null keeps the heavy
+-- per-(auction, token) probe into the 2 GB auction_prices table off the settled majority.
+-- Manual price corrections are NOT applied here: they are layered on top of BOTH price sources
+-- in `enriched` (see surplus_token_native_price), so a corrected value always wins.
+not_settled_surplus_price as (
+    select
+        w.auction_id,
+        w.order_uid,
+        ap.price / 1e18 as surplus_token_native_price
+    from windowed as w
+    join dbt.stg_backend_data__orders as o on o.uid = w.order_uid
+    left join dbt.stg_backend_data__auction_prices as ap
+        on ap.auction_id = w.auction_id
+       and ap.token = case when o.kind::text = 'sell' then o.buy_token else o.sell_token end
+    where w.tx_hash is null
 ),
 
 enriched as (
@@ -148,7 +166,9 @@ enriched as (
         hm.order_duration                   as seconds_to_settle,
         sv.name                             as solver_name,
         rc.batch_reward_cap_lower           as penalty_cap_native,
-        coalesce(apc.price, ap.price)       as surplus_token_native_price,
+        coalesce(apc.price / 1e18,
+                 pd.surplus_token_native_price,
+                 nsp.surplus_token_native_price) as surplus_token_native_price,
         sl.slippage_native,
         sl.slippage_usd
     from priced as p
@@ -162,14 +182,22 @@ enriched as (
     -- reward_config is the raw config seed (read directly; stg_reward_config only adds the
     -- network filter this join already applies). penalty_cap_native is its lower cap.
     left join dbt.reward_config as rc on rc.network = %(network)s
-    -- value the order on its SURPLUS side: buy token for sell orders, sell token for buy
-    -- orders. That token's auction native price is always present. The corrected price
-    -- (stg_auction_prices_corrections) overrides the raw auction price, matching dbt.
-    left join dbt.stg_backend_data__auction_prices as ap
-        on ap.auction_id = p.auction_id
-       and ap.token = case when o.kind::text = 'sell' then o.buy_token else o.sell_token end
+    -- value the order on its SURPLUS side (buy token for sell orders, sell token for buy).
+    -- surplus_token_native_price priority, highest first (all are native atoms per surplus-token
+    -- atom = auction price / 1e18; volume_native multiplies it directly, not /1e18):
+    --   1. stg_auction_prices_corrections -- the explicit manual price-correction seed, joined
+    --      LIVE on (auction_id, surplus token) so a corrected value always wins, rather than
+    --      relying on price_data's build-time snapshot of the same seed.
+    --   2. int_backend_data__price_data -- the per-trade corrected price for SETTLED attempts,
+    --      keyed/indexed on (auction_id, order_uid) (avoids probing the 2 GB auction_prices).
+    --   3. not_settled_surplus_price -- raw auction_prices, for NOT-settled attempts.
     left join dbt.stg_auction_prices_corrections as apc
-        on apc.auction_id = ap.auction_id and apc.token = ap.token
+        on apc.auction_id = p.auction_id
+       and apc.token = case when o.kind::text = 'sell' then o.buy_token else o.sell_token end
+    left join dbt.int_backend_data__price_data as pd
+        on pd.auction_id = p.auction_id and pd.order_uid = p.order_uid
+    left join not_settled_surplus_price as nsp
+        on nsp.auction_id = p.auction_id and nsp.order_uid = p.order_uid
     -- slippage is keyed per (auction_id, tx_hash); join on both so a tx that batches
     -- multiple auctions does not fan out / mis-attach the per-batch slippage.
     left join dbt.fct_slippage_per_transaction as sl
@@ -201,9 +229,10 @@ select
     limit_buy_amount,
     -- order size in native-token wei, valued on the surplus side (buy amount for sell
     -- orders, sell amount for buy orders); present for settled and not-settled attempts.
+    -- surplus_token_native_price already includes the /1e18 (see enriched).
     case
-        when kind::text = 'sell' then executed_buy  * surplus_token_native_price / 1e18
-        when kind::text = 'buy'  then executed_sell * surplus_token_native_price / 1e18
+        when kind::text = 'sell' then executed_buy  * surplus_token_native_price
+        when kind::text = 'buy'  then executed_sell * surplus_token_native_price
     end                                                     as volume_native,
     -- slippage tolerance: signed limit vs *effective* (corrected) quote price, in bps
     case

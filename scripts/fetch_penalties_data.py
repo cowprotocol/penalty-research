@@ -91,7 +91,18 @@ def fetch_orderbook(chain: str, start: datetime, end: datetime, environment: str
         options=f"-c default_transaction_read_only=on -c statement_timeout={timeout_s * 1000} -c timezone=UTC",
         **conn_kwargs,
     ) as conn, conn.cursor() as cur:
+        # Map the auction-time window to a block-number range and pass it to the main query as
+        # literal bounds the planner can estimate from. Doing this inline (a CTE over the
+        # block-timestamp table) would hide the bounds and freeze the plan into per-row probes
+        # (see sql/orderbook_dataset.sql). The `+ 0` keeps this a single seq-scan aggregate
+        # rather than an index walk from the chain tip back to the window.
         try:
+            cur.execute(
+                "select min(block_number + 0), max(block_number + 0) "
+                "from dbt.stg_rpc_data__block_timestamp where time >= %(start)s and time < %(end)s",
+                params,
+            )
+            params["block_lo"], params["block_hi"] = cur.fetchone()
             cur.execute(ORDERBOOK_SQL, params)
         except psycopg.errors.QueryCanceled:
             sys.exit(f"[db]   query exceeded --db-timeout ({timeout_s}s). "
