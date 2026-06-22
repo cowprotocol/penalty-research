@@ -171,6 +171,9 @@ def main() -> None:
         sys.exit("--end must be after --start")
     out = Path(args.out) if args.out else (
         REPO / "data" / f"{args.chain}_{args.start:%Y-%m-%d}_{args.end:%Y-%m-%d}.csv")
+    if out.exists():
+        print(f"[skip] {out} already exists; delete it to re-fetch", file=sys.stderr)
+        return
 
     print(f"[db]   {args.environment}_{CHAINS[args.chain]['db_network']} "
           f"{args.start:%Y-%m-%d}..{args.end:%Y-%m-%d}", file=sys.stderr)
