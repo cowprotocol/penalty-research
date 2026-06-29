@@ -13,6 +13,7 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "scipy>=1.14",
     "matplotlib>=3.9",
+    "plotly>=5.24",
 ]
 
 [tool.uv]
