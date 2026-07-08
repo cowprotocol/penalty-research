@@ -3,3 +3,6 @@
 # (run automatically in the devcontainer; see README for manual setup).
 *.ipynb filter=nbstripout
 *.ipynb diff=ipynb
+
+# Keep the volatility notebook outputs so results render on GitHub.
+short_term_volatility_estimation.ipynb -filter
