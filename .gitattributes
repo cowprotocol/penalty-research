@@ -6,3 +6,4 @@
 
 # Keep the volatility notebook outputs so results render on GitHub.
 short_term_volatility_estimation.ipynb -filter
+solver_revert_option_pricing.ipynb -filter
