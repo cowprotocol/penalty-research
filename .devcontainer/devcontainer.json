@@ -7,7 +7,9 @@
   // Sync the environment from the lockfile, then wire up nbstripout's git filters
   // for this clone (the filter config lives in .git/config, which is not committed).
   "postCreateCommand": "uv sync && uv run nbstripout --install",
-  "forwardPorts": [8888],
+  "forwardPorts": [
+    8888
+  ],
   "portsAttributes": {
     "8888": {
       "label": "JupyterLab",
@@ -26,5 +28,8 @@
         "python.terminal.activateEnvironment": false
       }
     }
+  },
+  "containerEnv": {
+    "BROWSER_PATH": "/usr/bin/chromium"
   }
 }

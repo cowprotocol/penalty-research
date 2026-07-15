@@ -22,3 +22,6 @@ RUN cd /tmp && uv python install && rm /tmp/.python-version
 
 # Put the project venv on PATH for interactive shells.
 ENV PATH=/workspaces/penalty-research/.venv/bin:$PATH
+
+# Install chromium (needed for plotting)
+RUN apt-get update && apt-get install -y chromium
