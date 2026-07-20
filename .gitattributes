@@ -3,4 +3,3 @@
 # (run automatically in the devcontainer; see README for manual setup).
 *.ipynb filter=nbstripout
 *.ipynb diff=ipynb
-notebooks/penalty_cap_empirical_approach_8pct.ipynb -filter
