@@ -4,6 +4,13 @@ Python notebooks running in a reproducible environment managed by [uv](https://d
 pinned to Python 3.13. Notebook outputs are stripped automatically on commit via
 [nbstripout](https://github.com/kynan/nbstripout), keeping diffs clean.
 
+## Repository layout
+
+- `notebooks/` — all analysis notebooks (outputs are stripped on commit; run them to reproduce results)
+- `data/` — local datasets and download caches (gitignored); notebooks reference it as `../data`
+- `scripts/` — data-fetching scripts (see `scripts/README.md`)
+- `sql/` — queries behind the datasets (see `docs/dataset.md`)
+
 ## Recommended: Dev Container
 
 Requires Docker + an editor with Dev Containers support (VS Code "Dev Containers"
