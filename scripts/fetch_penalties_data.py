@@ -7,7 +7,8 @@ Reverted winners are kept and flagged via `settled`.
 
 Sources:
   * cow-analytics-db Postgres (ANALYTICS_DB_URL) -- the spine: the dbt analytics
-    layer only. One database per network/environment (prod_<network>).
+    layer only, fetched via scripts/fetch_orderbook_data.py (the self-contained
+    DB-only variant of this script).
   * Dune (DUNE_API_KEY, saved query 7755542) -- USD order size + markout +
     settlement gas cost, joined on (order_uid, tx_hash).
 
@@ -21,30 +22,15 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-import psycopg
 from dotenv import load_dotenv
 
-REPO = Path(__file__).resolve().parent.parent
-DUNE_TRADE_MARKOUT_QUERY_ID = 7755542
-ORDERBOOK_SQL = (REPO / "sql" / "orderbook_dataset.sql").read_text()
+from fetch_orderbook_data import CHAINS, REPO, fetch_orderbook, normalize_hex, parse_day
 
-# chain -> names in each namespace. db_network forms the database (`<env>_<network>`);
-# dune is the cow_protocol_<x>.trades schema; reward_network keys dbt.reward_config /
-# the solver registry.
-CHAINS: dict[str, dict[str, str]] = {
-    "polygon":     {"dune": "polygon",     "db_network": "polygon",      "reward_network": "polygon"},
-    "bnb":         {"dune": "bnb",         "db_network": "bnb",          "reward_network": "bnb"},
-    # ready to extend:
-    "ethereum":    {"dune": "ethereum",    "db_network": "mainnet",      "reward_network": "mainnet"},
-    "gnosis":      {"dune": "gnosis",      "db_network": "xdai",         "reward_network": "gnosis"},
-    "arbitrum":    {"dune": "arbitrum",    "db_network": "arbitrum-one", "reward_network": "arbitrum"},
-    "base":        {"dune": "base",        "db_network": "base",         "reward_network": "base"},
-    "avalanche_c": {"dune": "avalanche_c", "db_network": "avalanche",    "reward_network": "avalanche"},
-}
+DUNE_TRADE_MARKOUT_QUERY_ID = 7755542
 
 # Columns Dune contributes (joined on order_uid + tx_hash). Everything else is from the DB.
 DUNE_COLS = ["order_size_usd", "markout_usd", "markout_relative", "execution_cost_native"]
@@ -55,62 +41,7 @@ DUNE_COLS = ["order_size_usd", "markout_usd", "markout_relative", "execution_cos
 DUNE_WINDOW_BUFFER = timedelta(days=1)
 
 
-# --- connection -------------------------------------------------------------
-
-def parse_endpoint(raw: str) -> dict:
-    """ANALYTICS_DB_URL is `user:pass@host:port` (no scheme, no db)."""
-    userinfo, hostinfo = raw.rsplit("@", 1)
-    user, password = userinfo.split(":", 1)
-    host, _, port = hostinfo.partition(":")
-    return {"host": host, "port": int(port or 5432), "user": user, "password": password}
-
-
-def db_name(chain: str, environment: str) -> str:
-    """Return the Postgres database name (`<env>_<network>`) for a chain + environment."""
-    return f"{environment}_{CHAINS[chain]['db_network']}"
-
-
-# --- sources ----------------------------------------------------------------
-
-def fetch_orderbook(chain: str, start: datetime, end: datetime, environment: str,
-                    timeout_s: int = 900) -> pd.DataFrame:
-    """All winning-solution orders + reward/penalty + slippage + timing (one row/attempt)."""
-    raw_url = os.environ.get("ANALYTICS_DB_URL")
-    if not raw_url:
-        sys.exit("ANALYTICS_DB_URL is not set (see .env.example).")
-    database = db_name(chain, environment)
-    params = {
-        "start": start,
-        "end": end,
-        "network": CHAINS[chain]["reward_network"],
-        "solver_env": "prod" if environment == "prod" else "barn",
-    }
-    conn_kwargs = parse_endpoint(raw_url)
-    with psycopg.connect(
-        dbname=database, connect_timeout=20, autocommit=True,
-        options=f"-c default_transaction_read_only=on -c statement_timeout={timeout_s * 1000} -c timezone=UTC",
-        **conn_kwargs,
-    ) as conn, conn.cursor() as cur:
-        # Map the auction-time window to a block-number range and pass it to the main query as
-        # literal bounds the planner can estimate from. Doing this inline (a CTE over the
-        # block-timestamp table) would hide the bounds and freeze the plan into per-row probes
-        # (see sql/orderbook_dataset.sql). The `+ 0` keeps this a single seq-scan aggregate
-        # rather than an index walk from the chain tip back to the window.
-        try:
-            cur.execute(
-                "select min(block_number + 0), max(block_number + 0) "
-                "from dbt.stg_rpc_data__block_timestamp where time >= %(start)s and time < %(end)s",
-                params,
-            )
-            params["block_lo"], params["block_hi"] = cur.fetchone()
-            cur.execute(ORDERBOOK_SQL, params)
-        except psycopg.errors.QueryCanceled:
-            sys.exit(f"[db]   query exceeded --db-timeout ({timeout_s}s). "
-                     "Narrow the --start/--end window or raise --db-timeout.")
-        cols = [d.name for d in cur.description]
-        rows = cur.fetchall()
-    return pd.DataFrame(rows, columns=cols)
-
+# --- Dune source ------------------------------------------------------------
 
 def fetch_dune_trades(chain: str, start: datetime, end: datetime) -> pd.DataFrame:
     """USD order size + markout per settled trade, keyed by (order_uid, tx_hash)."""
@@ -138,13 +69,6 @@ def fetch_dune_trades(chain: str, start: datetime, end: datetime) -> pd.DataFram
 
 # --- assembly ---------------------------------------------------------------
 
-def normalize_hex(v) -> str | None:
-    if v is None or (isinstance(v, float) and pd.isna(v)):
-        return None
-    s = str(v).lower()
-    return s if s.startswith("0x") else "0x" + s
-
-
 def assemble(orderbook: pd.DataFrame, dune: pd.DataFrame) -> pd.DataFrame:
     """Left-join Dune USD/markout onto the DB spine (keyed by (order_uid, tx_hash))."""
     orderbook["order_uid"] = orderbook["order_uid"].map(normalize_hex)
@@ -160,10 +84,6 @@ def assemble(orderbook: pd.DataFrame, dune: pd.DataFrame) -> pd.DataFrame:
 
 
 # --- CLI --------------------------------------------------------------------
-
-def parse_day(s: str) -> datetime:
-    return datetime.combine(date.fromisoformat(s), datetime.min.time(), tzinfo=timezone.utc)
-
 
 def main() -> None:
     load_dotenv(REPO / ".env")
