@@ -3,7 +3,14 @@
 `fetch_penalties_data.py` builds the penalties dataset CSV for one `(chain, time range)`
 (one row per auction × winning-solution order — see [`docs/dataset.md`](../docs/dataset.md)).
 
-First copy `.env.example` → `.env` and fill in `DUNE_API_KEY` + `ANALYTICS_DB_URL`, then `uv sync`.
+`fetch_orderbook_data.py` is the DB-only variant: same rows and flags, but it skips Dune
+entirely, so the four Dune-sourced columns (`order_size_usd`, `markout_usd`,
+`markout_relative`, `execution_cost_native`) are absent. It writes
+`data/{chain}_{start}_{end}_db.csv`, needs only `ANALYTICS_DB_URL`, and is what
+`notebooks/fixed_caps_from_revert_target.ipynb` invokes when a chain extract is missing.
+
+First copy `.env.example` → `.env` and fill in `DUNE_API_KEY` + `ANALYTICS_DB_URL`
+(only the latter for `fetch_orderbook_data.py`), then `uv sync`.
 
 `--start` is inclusive, `--end` exclusive (both UTC dates). Each run writes
 `data/{chain}_{start}_{end}.csv`. Below: ~6 months from `2026-01-01`, one line per
