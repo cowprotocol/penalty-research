@@ -1,32 +1,28 @@
 #!/usr/bin/env python
-"""Fetch the analytics-DB inputs needed by the analysis.
+"""Fetch the analytics-DB inputs for the penalty-cap counterfactual notebook.
 
-The script writes two CSV files:
+Writes three CSVs per chain and window, holding only what the counterfactual
+consumes:
 
-1. Order-level dataset:
-   One row per auction x winning-solution order, using the existing
-   sql/orderbook_dataset.sql query. The exact production accounting-period
-   identifiers and boundaries are attached from
-   dbt.int_accounting_period_data__conversion_rates.
+  <chain>_<start>_<end>.csv                     sql/counterfactual_rewards.sql
+      one row per (auction, solver): capped and uncapped reward/penalty, the
+      upper reward cap, the penalty-exclusion flag, and the accounting period.
 
-2. Consistency-share dataset:
-   One row per accounting_period x solver from
-   dbt.fct_consistency_rewards_per_solver_and_accounting_period.
+  <chain>_<start>_<end>_failed_volumes.csv      sql/counterfactual_failed_volumes.sql
+      one row per (auction, solver, sell_token, buy_token) for NOT-settled
+      orders only -- the only ones a volume-based penalty cap applies to.
 
-Sources:
-  * cow-analytics-db Postgres only (ANALYTICS_DB_URL).
-  * One database per network/environment: <env>_<network>.
+  <chain>_<start>_<end>_consistency_shares.csv
+      one row per (accounting_period, solver).
+
+Source: cow-analytics-db Postgres only (ANALYTICS_DB_URL), one database per
+network: prod_<network>.
 
 Usage:
-    python scripts/fetch_penalties_data_cons.py \
-        --chain ethereum \
-        --start 2026-05-26 \
-        --end 2026-06-30
-Note: The script should be run from a Tuesday to Tuesday as the incomplete accounting period leads to wrong consistency reward allocation.
+    python scripts/fetch_data.py --chain ethereum --start 2026-06-30 --end 2026-07-28
 
-Default outputs:
-    data/ethereum_2026-05-05_2026-07-21.csv
-    data/ethereum_2026-05-05_2026-07-21_consistency_shares.csv
+--start and --end must both be Tuesdays: accounting periods run Tuesday to
+Tuesday, and a partial period mis-attributes the consistency rewards.
 """
 
 from __future__ import annotations
@@ -42,7 +38,8 @@ import psycopg
 from dotenv import load_dotenv
 
 REPO = Path(__file__).resolve().parent.parent
-ORDERBOOK_SQL = (REPO / "sql" / "orderbook_dataset.sql").read_text()
+REWARDS_SQL = (REPO / "sql" / "counterfactual_rewards.sql").read_text()
+FAILED_VOLUMES_SQL = (REPO / "sql" / "counterfactual_failed_volumes.sql").read_text()
 
 # Canonical CLI chain -> analytics DB network and reward-config network.
 CHAINS: dict[str, dict[str, str]] = {
@@ -54,6 +51,12 @@ CHAINS: dict[str, dict[str, str]] = {
     "polygon": {"db_network": "polygon", "reward_network": "polygon"},
     "bnb": {"db_network": "bnb", "reward_network": "bnb"},
 }
+
+BLOCK_RANGE_SQL = """
+select min(block_number), max(block_number)
+from dbt.stg_rpc_data__block_timestamp
+where time >= %(start)s and time < %(end)s
+"""
 
 ACCOUNTING_PERIOD_SQL = """
 select
@@ -82,21 +85,6 @@ inner join selected_periods as p
 order by c.accounting_period, c.solver
 """
 
-ORDER_OUTPUT_COLUMNS = [
-    "auction_id",
-    "order_uid",
-    "solver",
-    "accounting_period",
-    "sell_token",
-    "buy_token",
-    "settled",
-    "is_excluded_from_penalties",
-    "volume_native",
-    "reward_penalty_native",
-    "reward_penalty_uncapped_native",
-    "reward_cap_upper_native",
-]
-
 
 def parse_endpoint(raw: str) -> dict[str, object]:
     try:
@@ -104,42 +92,51 @@ def parse_endpoint(raw: str) -> dict[str, object]:
         user, password = userinfo.split(":", 1)
         host, _, port = hostinfo.partition(":")
     except ValueError as exc:
-        raise ValueError(
+        raise SystemExit(
             "ANALYTICS_DB_URL must have the form user:password@host:port"
         ) from exc
 
-    return {
-        "host": host,
-        "port": int(port or 5432),
-        "user": user,
-        "password": password,
-    }
+    return {"host": host, "port": int(port or 5432), "user": user, "password": password}
 
 
-def dataframe_from_cursor(cur: psycopg.Cursor) -> pd.DataFrame:
+def read_frame(cur: psycopg.Cursor, sql: str, params: dict) -> pd.DataFrame:
+    """Run a query, building the frame in batches.
+
+    fetchall() would hold the full list of row tuples and the DataFrame at the
+    same time; that peak is enough to get the process OOM-killed on the busiest
+    chain, so the rows are consumed in batches instead.
+    """
+    cur.execute(sql, params)
     columns = [description.name for description in cur.description]
-    return pd.DataFrame(cur.fetchall(), columns=columns)
+
+    frames: list[pd.DataFrame] = []
+    while rows := cur.fetchmany(10_000):
+        frames.append(pd.DataFrame(rows, columns=columns))
+
+    if not frames:
+        return pd.DataFrame(columns=columns)
+    return pd.concat(frames, ignore_index=True)
 
 
-def fetch_inputs(
+def fetch(
     chain: str,
     start: datetime,
     end: datetime,
     timeout_s: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> dict[str, pd.DataFrame]:
     raw_url = os.environ.get("ANALYTICS_DB_URL")
     if not raw_url:
         sys.exit("ANALYTICS_DB_URL is not set.")
 
-    chain_config = CHAINS[chain]
-    database = f"prod_{chain_config['db_network']}"
-
+    config = CHAINS[chain]
+    database = f"prod_{config['db_network']}"
     params: dict[str, object] = {
         "start": start,
         "end": end,
-        "network": chain_config["reward_network"],
+        "network": config["reward_network"],
         "solver_env": "prod",
     }
+    print(f"[db] {database} {start:%Y-%m-%d}..{end:%Y-%m-%d}", file=sys.stderr)
 
     try:
         with (
@@ -156,31 +153,18 @@ def fetch_inputs(
             ) as conn,
             conn.cursor() as cur,
         ):
-            cur.execute(
-                """
-                select min(block_number), max(block_number)
-                from dbt.stg_rpc_data__block_timestamp
-                where time >= %(start)s
-                  and time < %(end)s
-                """,
-                params,
-            )
+            # The block bracket is passed into the big queries as a literal so the
+            # planner can estimate its selectivity -- see sql/orderbook_dataset.sql
+            # for why deriving it inline instead cripples the plan.
+            cur.execute(BLOCK_RANGE_SQL, params)
             params["block_lo"], params["block_hi"] = cur.fetchone()
+            if params["block_lo"] is None:
+                sys.exit(f"[db] no blocks found for this window in {database}")
 
-            if params["block_lo"] is None or params["block_hi"] is None:
-                sys.exit(
-                    f"[db] no blocks found for {start.isoformat()}..{end.isoformat()} "
-                    f"in {database}"
-                )
-
-            cur.execute(ORDERBOOK_SQL, params)
-            orders = dataframe_from_cursor(cur)
-
-            cur.execute(ACCOUNTING_PERIOD_SQL, params)
-            period_map = dataframe_from_cursor(cur)
-
-            cur.execute(CONSISTENCY_SHARES_SQL, params)
-            shares = dataframe_from_cursor(cur)
+            rewards = read_frame(cur, REWARDS_SQL, params)
+            volumes = read_frame(cur, FAILED_VOLUMES_SQL, params)
+            periods = read_frame(cur, ACCOUNTING_PERIOD_SQL, params)
+            shares = read_frame(cur, CONSISTENCY_SHARES_SQL, params)
 
     except psycopg.errors.QueryCanceled:
         sys.exit(
@@ -190,74 +174,30 @@ def fetch_inputs(
     except psycopg.Error as exc:
         sys.exit(f"[db] PostgreSQL error while reading {database}: {exc}")
 
-    if orders.empty:
-        return orders, shares
+    rewards = rewards.merge(
+        periods, on="block_deadline", how="left", validate="many_to_one"
+    ).drop(columns="block_deadline")
 
-    if "block_deadline" not in orders.columns:
-        raise RuntimeError("sql/orderbook_dataset.sql must return block_deadline.")
+    if rewards.duplicated(["auction_id", "solver"]).any():
+        sys.exit("counterfactual_rewards.sql returned duplicate (auction, solver) rows")
 
-    orders = orders.merge(
-        period_map,
-        on="block_deadline",
-        how="left",
-        validate="many_to_one",
-    )
+    no_period = int(rewards["accounting_period"].isna().sum())
+    if no_period:
+        sys.exit(f"{no_period}/{len(rewards)} reward rows have no accounting period")
 
-    missing_columns = sorted(set(ORDER_OUTPUT_COLUMNS) - set(orders.columns))
-    if missing_columns:
-        raise KeyError(
-            f"orderbook_dataset.sql is missing required columns: {missing_columns}"
-        )
+    for frame in (rewards, volumes, shares):
+        frame.insert(0, "blockchain", chain)
 
-    orders = orders[ORDER_OUTPUT_COLUMNS].copy()
-
-    raw_key = ["auction_id", "solver", "order_uid"]
-    duplicates = orders.duplicated(raw_key, keep=False)
-    if duplicates.any():
-        raise ValueError(
-            "Duplicate auction-solver-order rows found:\n"
-            + orders.loc[duplicates, raw_key].head(20).to_string(index=False)
-        )
-
-    missing_periods = int(orders["accounting_period"].isna().sum())
-    if missing_periods:
-        raise ValueError(
-            f"{missing_periods}/{len(orders)} order rows have no accounting period."
-        )
-
-    return orders, shares
+    return {
+        "": rewards,
+        "_failed_volumes": volumes,
+        "_consistency_shares": shares,
+    }
 
 
 def parse_day(value: str) -> datetime:
     return datetime.combine(
-        date.fromisoformat(value),
-        datetime.min.time(),
-        tzinfo=timezone.utc,
-    )
-
-
-def complete_accounting_window(
-    start: datetime,
-    end: datetime,
-) -> tuple[datetime, datetime]:
-    days_to_next_tuesday = (1 - start.weekday()) % 7
-    complete_start = start + pd.Timedelta(days=days_to_next_tuesday)
-
-    days_since_tuesday = (end.weekday() - 1) % 7
-    complete_end = end - pd.Timedelta(days=days_since_tuesday)
-
-    if complete_end <= complete_start:
-        raise ValueError(
-            "The requested range does not contain a complete "
-            "Tuesday-to-Tuesday accounting period."
-        )
-
-    return complete_start, complete_end
-
-
-def consistency_path(order_path: Path) -> Path:
-    return order_path.with_name(
-        f"{order_path.stem}_consistency_shares{order_path.suffix}"
+        date.fromisoformat(value), datetime.min.time(), tzinfo=timezone.utc
     )
 
 
@@ -272,64 +212,42 @@ def main() -> None:
     parser.add_argument("--db-timeout", type=int, default=900)
     args = parser.parse_args()
 
+    # Accounting periods run Tuesday to Tuesday; an incomplete period silently
+    # mis-attributes the consistency rewards, so reject it rather than adjust it.
+    if args.start.weekday() != 1 or args.end.weekday() != 1:
+        sys.exit("--start and --end must both be Tuesdays (accounting-period bounds)")
     if args.end <= args.start:
         sys.exit("--end must be after --start")
 
-    requested_start = args.start
-    requested_end = args.end
-    args.start, args.end = complete_accounting_window(args.start, args.end)
-    if args.start != requested_start or args.end != requested_end:
-        print(
-            "[dates] adjusted to complete accounting periods: "
-            f"{requested_start:%Y-%m-%d}..{requested_end:%Y-%m-%d} "
-            f"-> {args.start:%Y-%m-%d}..{args.end:%Y-%m-%d}",
-            file=sys.stderr,
-        )
-    order_out = (
+    base = (
         Path(args.out)
         if args.out
-        else REPO
-        / "data"
-        / f"{args.chain}_{args.start:%Y-%m-%d}_{args.end:%Y-%m-%d}.csv"
+        else REPO / "data" / f"{args.chain}_{args.start:%Y-%m-%d}_{args.end:%Y-%m-%d}.csv"
     )
-    shares_out = consistency_path(order_out)
+    paths = {
+        suffix: base.with_name(f"{base.stem}{suffix}{base.suffix}")
+        for suffix in ("", "_failed_volumes", "_consistency_shares")
+    }
 
-    if order_out.exists() and shares_out.exists():
+    if all(path.exists() for path in paths.values()):
         print(
             f"[skip] cached files already exist for {args.chain}: "
-            f"{order_out.name}, {shares_out.name}",
+            + ", ".join(path.name for path in paths.values()),
             file=sys.stderr,
         )
         return
 
-    if order_out.exists() or shares_out.exists():
-        print(
-            "[cache] only one output exists; refetching and writing both files",
-            file=sys.stderr,
-        )
+    frames = fetch(args.chain, args.start, args.end, args.db_timeout)
 
-    database = f"prod_{CHAINS[args.chain]['db_network']}"
-    print(
-        f"[db] {database} {args.start:%Y-%m-%d}..{args.end:%Y-%m-%d}",
-        file=sys.stderr,
-    )
-
-    orders, shares = fetch_inputs(
-        chain=args.chain,
-        start=args.start,
-        end=args.end,
-        timeout_s=args.db_timeout,
-    )
-
-    orders.insert(0, "blockchain", args.chain)
-    shares.insert(0, "blockchain", args.chain)
-
-    order_out.parent.mkdir(parents=True, exist_ok=True)
-    orders.to_csv(order_out, index=False)
-    shares.to_csv(shares_out, index=False)
-
-    print(f"[out] wrote {len(orders)} rows -> {order_out}", file=sys.stderr)
-    print(f"[out] wrote {len(shares)} rows -> {shares_out}", file=sys.stderr)
+    base.parent.mkdir(parents=True, exist_ok=True)
+    for suffix, frame in frames.items():
+        path = paths[suffix]
+        # Write via a scratch name so an interrupted run cannot leave a truncated
+        # CSV that the next run would treat as a complete cache entry.
+        scratch = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        frame.to_csv(scratch, index=False)
+        scratch.replace(path)
+        print(f"[out] wrote {len(frame)} rows -> {path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
