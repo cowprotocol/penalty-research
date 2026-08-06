@@ -10,6 +10,17 @@ flags, but no Dune, so the four Dune-sourced columns (`order_size_usd`, `markout
 `data/{chain}_{start}_{end}_db.csv`, needs only `ANALYTICS_DB_URL`, and is what
 `notebooks/fixed_caps_from_revert_target.ipynb` invokes when a chain extract is missing.
 
+`derive_pairs.py` derives the `PAIRS` table hardcoded in
+`notebooks/fixed_caps_from_revert_target.ipynb` — the token pairs the caps are fitted on and
+their CoW flow weights — and prints a ready-to-paste literal. The notebook does not call it:
+the list only changes when CoW's traded pairs shift. Its default window matches `MONTHS` in
+the notebook, and it warns if the extracts do not span it.
+
+```bash
+uv run python scripts/derive_pairs.py                                  # notebook's window
+uv run python scripts/derive_pairs.py --start 2026-05-01 --end 2026-08-01 --top 10
+```
+
 First copy `.env.example` → `.env` and fill in `DUNE_API_KEY` + `ANALYTICS_DB_URL`
 (only the latter for `fetch_orderbook_data.py`), then `uv sync`.
 
