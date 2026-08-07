@@ -1,9 +1,10 @@
 -- Capped / uncapped rewards per (auction, solver) for the penalty-cap counterfactual.
 --
 -- Grain: one row per (auction_id, solver) whose winning solution had at least one
--- proposed trade execution in the window. That "at least one" condition is what
--- sql/orderbook_dataset.sql implies by joining proposed_trade_executions, and it is
--- kept here as a semi-join so the row set matches without fanning out per order.
+-- order present in stg_backend_data__orders. sql/counterfactual_failed_orders.sql
+-- selects over the same joins, so both queries cover exactly the same auctions:
+-- an auction whose orders are missing there has no computable failed volume, and
+-- including it would count its current penalty against a proposed cap of zero.
 --
 -- Every winning solution belongs here, not only the penalised ones: the consistency
 -- budget the counterfactual reallocates is sum(upper_reward_cap - net_batch) over ALL
@@ -15,7 +16,7 @@
 --                             sql/orderbook_dataset.sql for why these are passed in
 --                             as literals rather than derived in a CTE)
 with windowed as (
-    select
+    select distinct
         ws.auction_id,
         ws.solver,
         ws.block_deadline
@@ -23,23 +24,12 @@ with windowed as (
     join dbt.stg_rpc_data__block_timestamp as bt
         on bt.block_number = ws.block_deadline
        and bt.time >= %(start)s and bt.time < %(end)s
+    join dbt.stg_backend_data__proposed_trade_executions as pte
+        on pte.auction_id = ws.auction_id
+       and pte.solution_uid = ws.solution_uid
+    join dbt.stg_backend_data__orders as o
+        on o.uid = pte.order_uid
     where ws.block_deadline between %(block_lo)s and %(block_hi)s
-      -- The order join is part of the row-set definition, not decoration:
-      -- sql/orderbook_dataset.sql joins stg_backend_data__orders inline, so a
-      -- winning solution whose orders are all absent from that table does not
-      -- appear there either. Those rows carry upper_reward_cap = 0, which would
-      -- make consistency_budget (= upper_reward_cap - net_batch) negative for any
-      -- of them holding a positive reward -- a case the counterfactual rejects
-      -- outright. Kept identical here rather than quietly widened.
-      and exists (
-          select 1
-          from dbt.stg_backend_data__proposed_trade_executions as pte
-          join dbt.stg_backend_data__orders as o
-              on o.uid = pte.order_uid
-          where pte.auction_id = ws.auction_id
-            and pte.solution_uid = ws.solution_uid
-      )
-    group by ws.auction_id, ws.solver, ws.block_deadline
 )
 
 select
