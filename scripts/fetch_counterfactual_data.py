@@ -53,14 +53,6 @@ CHAINS = {
     "base": "base", "avalanche_c": "avalanche", "polygon": "polygon", "bnb": "bnb",
 }
 
-ACCOUNTING_PERIOD_SQL = """
-select
-    block_number as block_deadline,
-    accounting_period
-from dbt.int_accounting_period_data__conversion_rates
-where block_time >= %(start)s and block_time < %(end)s
-"""
-
 
 
 def parse_endpoint(raw: str) -> dict[str, object]:
@@ -126,7 +118,6 @@ def fetch(
         ):
             rewards = read_frame(cur, REWARDS_SQL, params)
             volumes = read_frame(cur, FAILED_ORDERS_SQL, params)
-            periods = read_frame(cur, ACCOUNTING_PERIOD_SQL, params)
             shares = read_frame(cur, CONSISTENCY_SHARES_SQL, params)
 
     except psycopg.errors.QueryCanceled:
@@ -136,10 +127,6 @@ def fetch(
         )
     except psycopg.Error as exc:
         sys.exit(f"[db] PostgreSQL error while reading {database}: {exc}")
-
-    rewards = rewards.merge(
-        periods, on="block_deadline", how="left", validate="many_to_one"
-    ).drop(columns="block_deadline")
 
     if rewards.duplicated(["auction_id", "solver"]).any():
         sys.exit("counterfactual_rewards.sql returned duplicate (auction, solver) rows")

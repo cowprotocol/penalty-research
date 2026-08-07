@@ -60,3 +60,4 @@ left join dbt.stg_backend_data__auction_prices as ap
     on ap.auction_id = w.auction_id
    and ap.token = w.surplus_token
 group by w.auction_id, w.solver, w.order_uid, w.sell_token, w.buy_token
+order by w.auction_id, w.solver, w.order_uid
