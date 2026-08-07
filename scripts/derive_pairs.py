@@ -42,7 +42,7 @@ REPO = Path(__file__).resolve().parent.parent
 
 # Keep these in step with MONTHS in the notebook: the flow weights should come from the same
 # period as the prices the caps are fitted on.
-DEFAULT_START, DEFAULT_END = "2026-05-01", "2026-07-31"
+DEFAULT_START, DEFAULT_END = "2026-05-01", "2026-08-01"   # end is EXCLUSIVE
 
 # CMS network name per chain, for the correlated-token bucket lists.
 CMS_NET = {"ethereum": "MAINNET", "arbitrum": "ARBITRUM", "base": "BASE", "gnosis": "GNOSIS",
@@ -93,6 +93,7 @@ USDC_ADDRS = {
     "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",   # polygon (USDC.e)
     "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",   # bnb
     "0xddafbb505ad214d7b80b1f830fccc89b60fb7a83",   # gnosis
+    "0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e",   # avalanche
 }
 
 # Non-USD fiat pegs that sit inside CoW's "Stables" buckets alongside USD ones.
@@ -118,7 +119,10 @@ def pick_extract(files: list[str], start: str, end: str) -> str:
         lo, hi = pd.Timestamp(a, tz="UTC"), pd.Timestamp(b, tz="UTC")
         return max(pd.Timedelta(0), min(hi, w1) - max(lo, w0))
 
-    return max(files, key=overlap)
+    best = max(sorted(files), key=overlap)          # sorted() so ties are deterministic
+    if overlap(best) <= pd.Timedelta(0):
+        raise SystemExit(f"no extract overlaps {start}..{end}; closest is {best}")
+    return best
 
 
 def load_attempts(data_dir: Path, start: str, end: str) -> pd.DataFrame:
@@ -143,25 +147,24 @@ def load_attempts(data_dir: Path, start: str, end: str) -> pd.DataFrame:
         print(f"  {chain:12s} {os.path.basename(chosen)}")
     att = pd.concat(frames, ignore_index=True)
     att["ts"] = pd.to_datetime(att.auction_timestamp, utc=True, format="mixed")
-    covered_lo, covered_hi = att.ts.min(), att.ts.max()
+    per_chain = att.groupby("chain").ts.agg(["min", "max"])
     att = att[(att.ts >= pd.Timestamp(start, tz="UTC"))
               & (att.ts < pd.Timestamp(end, tz="UTC"))].copy()
     att["sell_token"] = att.sell_token.str.lower()
     att["buy_token"] = att.buy_token.str.lower()
 
-    print(f"requested window : {start} .. {end}")
-    print(f"extract coverage : {covered_lo.date()} .. {covered_hi.date()}")
-    if covered_lo > pd.Timestamp(start, tz="UTC") or covered_hi < pd.Timestamp(end, tz="UTC"):
-        print(f"[WARN] the extracts do not span the requested window -- weights are computed "
-              f"only over {max(covered_lo, pd.Timestamp(start, tz='UTC')).date()} .. "
-              f"{min(covered_hi, pd.Timestamp(end, tz='UTC')).date()}.\n"
-              f"       Re-fetch with scripts/fetch_orderbook_data.py --end {end} to close the "
-              f"gap.", file=sys.stderr)
+    # `end` is exclusive, so full coverage means reaching the last day, not `end` itself
+    w0, w_last = pd.Timestamp(start, tz="UTC"), pd.Timestamp(end, tz="UTC") - pd.Timedelta("1D")
+    print(f"requested window : {start} .. {end} (exclusive)")
+    for chain, row in per_chain.iterrows():
+        short = row["min"] > w0 or row["max"] < w_last
+        print(f"  {chain:12s} {row['min'].date()} .. {row['max'].date()}"
+              f"{'   [WARN] does not span the window' if short else ''}")
     return att
 
 
 def build_resolvers(data_dir: Path):
-    """(book_of, bucket_of, usd_books) -- address -> Binance book, and the USD-pegged set."""
+    """(book_of, bucket_of, is_usd_leg, symbol_of) -- token address -> price series."""
     cms = cached_json(data_dir / "cow_correlated_tokens.json",
                       "https://cms.cow.finance/api/correlated-tokens"
                       "?pagination%5BpageSize%5D=100")
@@ -189,27 +192,48 @@ def build_resolvers(data_dir: Path):
         if not sym:
             return None
         u = sym.upper()
-        if u == "USDT" or u in bases:
-            return u
-        return WRAPPED.get(u)
+        if u in WRAPPED:                 # before the `bases` test: WBTCUSDT exists but is thin
+            return WRAPPED[u]
+        return u if (u == "USDT" or u in bases) else None
 
     def bucket_of(chain, addr):
         return next((n for n, t in buckets.get(chain, {}).items() if addr in t), None)
 
-    usd_books = set()
-    for c in CMS_NET:
-        for toks in buckets[c].values():
-            if any(a in USDC_ADDRS for a in toks):        # the bucket USDC lives in
-                usd_books.update(filter(None, (book_of(c, a) for a in toks)))
-
     def symbol_of(chain, addr):
         return symbol.get(chain, {}).get(addr)
 
-    return book_of, bucket_of, usd_books, symbol_of
+    usd_buckets = {(c, name) for c in CMS_NET for name, toks in buckets[c].items()
+                   if any(a in USDC_ADDRS for a in toks)}
+
+    def _bucket_usd(chain, addr):
+        b = bucket_of(chain, addr)
+        return (b is not None and (chain, b) in usd_buckets
+                and peg_kind(symbol_of(chain, addr), b) == "usd")
+
+    # the dollar books, i.e. those reachable from a USD bucket and not a non-USD peg sharing it
+    usd_books = {book_of(c, a) for c in CMS_NET for name, toks in buckets[c].items()
+                 if (c, name) in usd_buckets for a in toks
+                 if book_of(c, a) and _bucket_usd(c, a)}
+
+    def is_usd_leg(chain, addr):
+        """A USD-pegged stable: in the bucket that holds USDC, or resolving to a dollar book.
+
+        The second test catches USDC/USDT variants CoW has not bucketed, which would otherwise
+        split off as their own pair (e.g. BTC<->USDC alongside BTC<->USD).
+        """
+        return _bucket_usd(chain, addr) or book_of(chain, addr) in usd_books
+
+    return book_of, bucket_of, is_usd_leg, symbol_of
 
 
-def peg_kind(sym: str | None) -> str:
-    """Rough split of a stable's peg, for reporting what the correlated tier contains."""
+def peg_kind(sym: str | None, bucket: str | None = None) -> str:
+    """What a correlated-bucket token is pegged to.
+
+    Order matters: the equity test runs first because several tokenised tickers contain an FX
+    substring (COPon, PENGon, OPENon) and would otherwise be misfiled as other-fx.
+    """
+    if bucket and "WETH assets" in bucket:   # ETH and its liquid-staking tokens
+        return "eth"
     u = (sym or "").upper()
     if u.endswith("ON") and len(u) > 3:      # tokenised equities/ETFs: AAPLon, TSLAon, ...
         return "equity"
@@ -233,14 +257,21 @@ def main() -> None:
     args = p.parse_args()
 
     att = load_attempts(args.data_dir, args.start, args.end)
-    book_of, bucket_of, usd_books, symbol_of = build_resolvers(args.data_dir)
+    book_of, bucket_of, is_usd_leg, symbol_of = build_resolvers(args.data_dir)
     total = len(att)
     print(f"attempts in window: {total:,}\n")
 
     pairs = (att.groupby(["chain", "sell_token", "buy_token"]).size()
                 .rename("attempts").reset_index())
-    pairs["book_s"] = [book_of(c, a) for c, a in zip(pairs.chain, pairs.sell_token)]
-    pairs["book_b"] = [book_of(c, a) for c, a in zip(pairs.chain, pairs.buy_token)]
+    # A leg is either "USD" -- priced as the constant 1, so it needs no Binance book -- or the
+    # base asset whose USDT book prices it. Resolving to the price series BEFORE the
+    # resolvability filter is what keeps ETH<->DAI, ETH<->GHO etc. in: they are ETH against a
+    # dollar exactly as ETH<->USDC is.
+    def leg_of(chain, addr):
+        return "USD" if is_usd_leg(chain, addr) else book_of(chain, addr)
+
+    pairs["book_s"] = [leg_of(c, a) for c, a in zip(pairs.chain, pairs.sell_token)]
+    pairs["book_b"] = [leg_of(c, a) for c, a in zip(pairs.chain, pairs.buy_token)]
     pairs["tier"] = ["correlated" if (bucket_of(c, s) is not None
                                       and bucket_of(c, s) == bucket_of(c, b)) else "uncorrelated"
                      for c, s, b in zip(pairs.chain, pairs.sell_token, pairs.buy_token)]
@@ -252,10 +283,7 @@ def main() -> None:
 
     # ---- uncorrelated: merge USD-pegged legs, drop direction, rank by flow
     merged = res[res.tier == "uncorrelated"].copy()
-    merged["a"] = merged.book_s.map(lambda b: "USD" if b in usd_books else b)
-    merged["b"] = merged.book_b.map(lambda b: "USD" if b in usd_books else b)
-    merged = merged[merged.a != merged.b]                 # USD<->USD is the correlated tier
-    merged["key"] = ["|".join(sorted([a, b])) for a, b in zip(merged.a, merged.b)]
+    merged["key"] = ["|".join(sorted([a, b])) for a, b in zip(merged.book_s, merged.book_b)]
     unc = (merged.groupby("key").attempts.sum()
                  .sort_values(ascending=False).reset_index())
     if args.exclude:
@@ -275,11 +303,15 @@ def main() -> None:
     # at all, so restricting this to `res` would hide nearly all of them.
     corr = pairs[pairs.tier == "correlated"].copy()
     corr["kind"] = [
-        "usd<->usd" if {peg_kind(symbol_of(c, s)), peg_kind(symbol_of(c, b))} == {"usd"}
-        else " / ".join(sorted({peg_kind(symbol_of(c, s)), peg_kind(symbol_of(c, b))}))
+        "usd<->usd" if {peg_kind(symbol_of(c, s), bucket_of(c, s)),
+                        peg_kind(symbol_of(c, b), bucket_of(c, b))} == {"usd"}
+        else " / ".join(sorted({peg_kind(symbol_of(c, s), bucket_of(c, s)),
+                                peg_kind(symbol_of(c, b), bucket_of(c, b))}))
         for c, s, b in zip(corr.chain, corr.sell_token, corr.buy_token)]
-    corr["resolvable"] = [isinstance(a, str) and isinstance(b, str) and a != b
-                          for a, b in zip(corr.book_s, corr.book_b)]
+    corr["resolvable"] = [isinstance(x, str) and isinstance(y, str) and x != y
+                          for x, y in ((book_of(c, s_), book_of(c, b_))
+                                       for c, s_, b_ in zip(corr.chain, corr.sell_token,
+                                                            corr.buy_token))]
     by_kind = corr.groupby("kind").agg(
         attempts=("attempts", "sum"),
         with_binance_feed=("attempts", lambda s_: int(
@@ -310,7 +342,8 @@ def main() -> None:
     print("=" * 78)
     print("\nBefore pasting, check each pair has a 1s kline archive on data.binance.vision:")
     print("  " + "  ".join(sorted({f"{x}USDT" for r in top.itertuples()
-                                   for x in r.key.split('|') if x != "USD"})))
+                                   for x in r.key.split("|") if x != "USD"}
+                                  | {"USDCUSDT"})))
 
 
 if __name__ == "__main__":
