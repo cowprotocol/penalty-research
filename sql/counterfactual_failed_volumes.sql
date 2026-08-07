@@ -36,7 +36,13 @@ with windowed as (
         on pte.auction_id = ws.auction_id
        and pte.solution_uid = ws.solution_uid
     where ws.block_deadline between %(block_lo)s and %(block_hi)s
-      and ws.tx_hash is null
+      -- Not settled BY THE DEADLINE, which is the condition the penalty tracks:
+      -- either the solution never landed, or it landed late. A late settlement
+      -- executed its orders, but not in time, so its volume is failed volume.
+      -- Matching on `tx_hash is null` alone would record zero failed volume for
+      -- every late settlement, waiving a penalty the protocol did charge -- that
+      -- is roughly half of all penalised auctions on arbitrum and avalanche.
+      and (ws.tx_hash is null or ws.block_number > ws.block_deadline)
 )
 
 select

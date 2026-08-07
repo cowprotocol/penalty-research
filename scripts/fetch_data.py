@@ -4,15 +4,18 @@
 Writes three CSVs per chain and window, holding only what the counterfactual
 consumes:
 
-  <chain>_<start>_<end>.csv                     sql/counterfactual_rewards.sql
+All three are named counterfactual_<chain>_<start>_<end>_<kind>.csv:
+
+  _rewards             sql/counterfactual_rewards.sql
       one row per (auction, solver): capped and uncapped reward/penalty, the
       upper reward cap, the penalty-exclusion flag, and the accounting period.
 
-  <chain>_<start>_<end>_failed_volumes.csv      sql/counterfactual_failed_volumes.sql
-      one row per (auction, solver, sell_token, buy_token) for NOT-settled
-      orders only -- the only ones a volume-based penalty cap applies to.
+  _failed_orders       sql/counterfactual_failed_volumes.sql
+      one row per (auction, solver, order_uid) for orders not settled by their
+      deadline -- never settled, or settled late. Orders are NOT pre-aggregated,
+      because the proposed cap is bounded per order.
 
-  <chain>_<start>_<end>_consistency_shares.csv
+  _consistency_shares
       one row per (accounting_period, solver).
 
 Source: cow-analytics-db Postgres only (ANALYTICS_DB_URL), one database per
@@ -189,8 +192,8 @@ def fetch(
         frame.insert(0, "blockchain", chain)
 
     return {
-        "": rewards,
-        "_failed_volumes": volumes,
+        "_rewards": rewards,
+        "_failed_orders": volumes,
         "_consistency_shares": shares,
     }
 
@@ -222,11 +225,12 @@ def main() -> None:
     base = (
         Path(args.out)
         if args.out
-        else REPO / "data" / f"{args.chain}_{args.start:%Y-%m-%d}_{args.end:%Y-%m-%d}.csv"
+        else REPO / "data"
+        / f"counterfactual_{args.chain}_{args.start:%Y-%m-%d}_{args.end:%Y-%m-%d}.csv"
     )
     paths = {
         suffix: base.with_name(f"{base.stem}{suffix}{base.suffix}")
-        for suffix in ("", "_failed_volumes", "_consistency_shares")
+        for suffix in ("_rewards", "_failed_orders", "_consistency_shares")
     }
 
     if all(path.exists() for path in paths.values()):
