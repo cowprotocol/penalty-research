@@ -53,18 +53,12 @@ CHAINS = {
     "base": "base", "avalanche_c": "avalanche", "polygon": "polygon", "bnb": "bnb",
 }
 
-BLOCK_RANGE_SQL = """
-select min(block_number), max(block_number)
-from dbt.stg_rpc_data__block_timestamp
-where time >= %(start)s and time < %(end)s
-"""
-
 ACCOUNTING_PERIOD_SQL = """
 select
     block_number as block_deadline,
     accounting_period
 from dbt.int_accounting_period_data__conversion_rates
-where block_number between %(block_lo)s and %(block_hi)s
+where block_time >= %(start)s and block_time < %(end)s
 """
 
 
@@ -130,14 +124,6 @@ def fetch(
             ) as conn,
             conn.cursor() as cur,
         ):
-            # The block bracket is passed into the big queries as a literal so the
-            # planner can estimate its selectivity -- see sql/orderbook_dataset.sql
-            # for why deriving it inline instead cripples the plan.
-            cur.execute(BLOCK_RANGE_SQL, params)
-            params["block_lo"], params["block_hi"] = cur.fetchone()
-            if params["block_lo"] is None:
-                sys.exit(f"[db] no blocks found for this window in {database}")
-
             rewards = read_frame(cur, REWARDS_SQL, params)
             volumes = read_frame(cur, FAILED_ORDERS_SQL, params)
             periods = read_frame(cur, ACCOUNTING_PERIOD_SQL, params)

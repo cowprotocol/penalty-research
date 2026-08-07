@@ -1,24 +1,15 @@
--- Failed-order volume for the penalty-cap counterfactual.
+-- Volume of the orders that did not settle by their deadline -- either the
+-- solution never landed, or it landed late -- one row per (auction_id, solver,
+-- order_uid). Orders are not pre-aggregated, because the proposed penalty cap is
+-- bounded per order.
 --
--- Grain: one row per (auction_id, solver, order_uid). The proposed cap is bounded
--- per ORDER, so orders must not be pre-aggregated -- summing two orders on one
--- token pair and bounding the total gives a larger cap than bounding each and
--- adding. The token pair rides along because the correlated/uncorrelated rate is
--- applied downstream from the CoW token lists.
+-- Volume is the executed amount on the surplus side (buy amount for sell orders,
+-- sell amount for buy orders), in native-token wei. Price sources, highest
+-- priority first: stg_auction_prices_corrections, int_backend_data__price_data,
+-- stg_backend_data__auction_prices.
 --
--- The windowed CTE selects over the same joins as sql/counterfactual_rewards.sql,
--- plus the not-settled-in-time condition, so the two cover the same auctions.
---
--- Volume is valued on the SURPLUS side (buy amount for sell orders, sell amount
--- for buy orders) in native-token wei, with the same price priority as
--- sql/orderbook_dataset.sql:
---   1. stg_auction_prices_corrections   -- explicit manual correction, always wins
---   2. int_backend_data__price_data     -- per-trade corrected price
---   3. stg_backend_data__auction_prices -- raw auction price
--- All three are native atoms per surplus-token atom (auction price / 1e18), so
--- they multiply the executed amount directly.
---
--- Bind params: %(start)s, %(end)s, %(block_lo)s, %(block_hi)s (as in counterfactual_rewards.sql)
+-- Bind params:
+--   %(start)s, %(end)s  auction-time window [start, end)
 with windowed as (
     select
         ws.auction_id,
@@ -39,12 +30,7 @@ with windowed as (
        and pte.solution_uid = ws.solution_uid
     join dbt.stg_backend_data__orders as o
         on o.uid = pte.order_uid
-    where ws.block_deadline between %(block_lo)s and %(block_hi)s
-      -- The condition the penalty tracks: never landed, or landed late. A late
-      -- settlement executed its orders, but not in time, so its volume is failed
-      -- volume. Matching on `tx_hash is null` alone would waive the penalty on
-      -- every late settlement -- about half of them on arbitrum and avalanche.
-      and not ws.is_settled_in_time
+    where not ws.is_settled_in_time
 )
 
 select
@@ -73,5 +59,4 @@ left join dbt.int_backend_data__price_data as pd
 left join dbt.stg_backend_data__auction_prices as ap
     on ap.auction_id = w.auction_id
    and ap.token = w.surplus_token
--- an order can appear across several execution rows; those are one order here
 group by w.auction_id, w.solver, w.order_uid, w.sell_token, w.buy_token

@@ -1,11 +1,12 @@
--- Consistency-reward shares per (accounting_period, solver), for the periods
--- covered by the requested block range.
+-- Consistency-reward share per (accounting_period, solver), for every accounting
+-- period the window touches.
 --
--- Bind params: %(block_lo)s, %(block_hi)s
+-- Bind params:
+--   %(start)s, %(end)s  auction-time window [start, end)
 with selected_periods as (
     select distinct accounting_period
     from dbt.int_accounting_period_data__conversion_rates
-    where block_number between %(block_lo)s and %(block_hi)s
+    where block_time >= %(start)s and block_time < %(end)s
       and accounting_period is not null
 )
 select
