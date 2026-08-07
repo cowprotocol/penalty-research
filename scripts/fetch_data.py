@@ -2,9 +2,7 @@
 """Fetch the analytics-DB inputs for the penalty-cap counterfactual notebook.
 
 Writes three CSVs per chain and window, holding only what the counterfactual
-consumes:
-
-All three are named counterfactual_<chain>_<start>_<end>_<kind>.csv:
+consumes, named counterfactual_<chain>_<start>_<end>_<kind>.csv:
 
   _rewards             sql/counterfactual_rewards.sql
       one row per (auction, solver): capped and uncapped reward/penalty, the
@@ -44,15 +42,10 @@ REPO = Path(__file__).resolve().parent.parent
 REWARDS_SQL = (REPO / "sql" / "counterfactual_rewards.sql").read_text()
 FAILED_VOLUMES_SQL = (REPO / "sql" / "counterfactual_failed_volumes.sql").read_text()
 
-# Canonical CLI chain -> analytics DB network and reward-config network.
-CHAINS: dict[str, dict[str, str]] = {
-    "ethereum": {"db_network": "mainnet", "reward_network": "mainnet"},
-    "gnosis": {"db_network": "xdai", "reward_network": "gnosis"},
-    "arbitrum": {"db_network": "arbitrum-one", "reward_network": "arbitrum"},
-    "base": {"db_network": "base", "reward_network": "base"},
-    "avalanche_c": {"db_network": "avalanche", "reward_network": "avalanche"},
-    "polygon": {"db_network": "polygon", "reward_network": "polygon"},
-    "bnb": {"db_network": "bnb", "reward_network": "bnb"},
+# CLI chain name -> analytics DB network (database is prod_<network>).
+CHAINS = {
+    "ethereum": "mainnet", "gnosis": "xdai", "arbitrum": "arbitrum-one",
+    "base": "base", "avalanche_c": "avalanche", "polygon": "polygon", "bnb": "bnb",
 }
 
 BLOCK_RANGE_SQL = """
@@ -79,9 +72,7 @@ with selected_periods as (
 select
     c.accounting_period,
     '0x' || encode(c.solver, 'hex') as solver,
-    c.consistency_reward_share,
-    c.total_consistency_budget,
-    c.consistency_reward_native
+    c.consistency_reward_share
 from dbt.fct_consistency_rewards_per_solver_and_accounting_period as c
 inner join selected_periods as p
     on c.accounting_period = p.accounting_period
@@ -131,14 +122,8 @@ def fetch(
     if not raw_url:
         sys.exit("ANALYTICS_DB_URL is not set.")
 
-    config = CHAINS[chain]
-    database = f"prod_{config['db_network']}"
-    params: dict[str, object] = {
-        "start": start,
-        "end": end,
-        "network": config["reward_network"],
-        "solver_env": "prod",
-    }
+    database = f"prod_{CHAINS[chain]}"
+    params: dict[str, object] = {"start": start, "end": end}
     print(f"[db] {database} {start:%Y-%m-%d}..{end:%Y-%m-%d}", file=sys.stderr)
 
     try:
@@ -211,7 +196,6 @@ def main() -> None:
     parser.add_argument("--chain", required=True, choices=sorted(CHAINS))
     parser.add_argument("--start", required=True, type=parse_day)
     parser.add_argument("--end", required=True, type=parse_day)
-    parser.add_argument("--out", default=None)
     parser.add_argument("--db-timeout", type=int, default=900)
     args = parser.parse_args()
 
@@ -222,15 +206,11 @@ def main() -> None:
     if args.end <= args.start:
         sys.exit("--end must be after --start")
 
-    base = (
-        Path(args.out)
-        if args.out
-        else REPO / "data"
-        / f"counterfactual_{args.chain}_{args.start:%Y-%m-%d}_{args.end:%Y-%m-%d}.csv"
-    )
+    stem = f"counterfactual_{args.chain}_{args.start:%Y-%m-%d}_{args.end:%Y-%m-%d}"
+    data_dir = REPO / "data"
     paths = {
-        suffix: base.with_name(f"{base.stem}{suffix}{base.suffix}")
-        for suffix in ("_rewards", "_failed_orders", "_consistency_shares")
+        kind: data_dir / f"{stem}{kind}.csv"
+        for kind in ("_rewards", "_failed_orders", "_consistency_shares")
     }
 
     if all(path.exists() for path in paths.values()):
@@ -243,7 +223,7 @@ def main() -> None:
 
     frames = fetch(args.chain, args.start, args.end, args.db_timeout)
 
-    base.parent.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
     for suffix, frame in frames.items():
         path = paths[suffix]
         # Write via a scratch name so an interrupted run cannot leave a truncated
