@@ -5,9 +5,11 @@
 -- it, so only not-settled attempts are read here -- which also keeps the per-(auction,
 -- token) probe into the large auction_prices table off the settled majority.
 --
--- Grain: one row per (auction_id, solver, sell_token, buy_token), volume summed. The
--- correlated/uncorrelated split is applied downstream from the CoW token lists, so the
--- pair has to survive aggregation, but the individual orders do not.
+-- Grain: one row per (auction_id, solver, order_uid). The proposed cap is bounded per
+-- ORDER, so orders must not be pre-aggregated -- summing two orders on the same token
+-- pair and bounding the total would give a different (larger) cap than bounding each
+-- and adding. The token pair rides along because the correlated/uncorrelated rate is
+-- applied downstream from the CoW token lists.
 --
 -- Volume is valued on the SURPLUS side (buy amount for sell orders, sell amount for
 -- buy orders) in native-token wei, with the same price priority as
@@ -40,6 +42,7 @@ with windowed as (
 select
     w.auction_id,
     '0x' || encode(w.solver, 'hex')     as solver,
+    '0x' || encode(w.order_uid, 'hex')  as order_uid,
     '0x' || encode(o.sell_token, 'hex') as sell_token,
     '0x' || encode(o.buy_token, 'hex')  as buy_token,
     coalesce(
@@ -72,4 +75,6 @@ left join dbt.int_backend_data__price_data as pd
 left join dbt.stg_backend_data__auction_prices as ap
     on ap.auction_id = w.auction_id
    and ap.token = case when o.kind::text = 'sell' then o.buy_token else o.sell_token end
-group by w.auction_id, w.solver, o.sell_token, o.buy_token
+-- group by the order too: a solution can list an order across several execution
+-- rows, and those are one order for capping purposes.
+group by w.auction_id, w.solver, w.order_uid, o.sell_token, o.buy_token
