@@ -8,19 +8,19 @@ consumes, named counterfactual_<chain>_<start>_<end>_<kind>.csv:
       one row per (auction, solver): capped and uncapped reward/penalty, the
       upper reward cap, the penalty-exclusion flag, and the accounting period.
 
-  _failed_orders       sql/counterfactual_failed_volumes.sql
+  _failed_orders       sql/counterfactual_failed_orders.sql
       one row per (auction, solver, order_uid) for orders not settled by their
       deadline -- never settled, or settled late. Orders are NOT pre-aggregated,
       because the proposed cap is bounded per order.
 
-  _consistency_shares
+  _consistency_shares  sql/counterfactual_consistency_shares.sql
       one row per (accounting_period, solver).
 
 Source: cow-analytics-db Postgres only (ANALYTICS_DB_URL), one database per
 network: prod_<network>.
 
 Usage:
-    python scripts/fetch_data.py --chain ethereum --start 2026-06-30 --end 2026-07-28
+    python scripts/fetch_counterfactual_data.py --chain ethereum --start 2026-06-30 --end 2026-07-28
 
 --start and --end must both be Tuesdays: accounting periods run Tuesday to
 Tuesday, and a partial period mis-attributes the consistency rewards.
@@ -39,8 +39,13 @@ import psycopg
 from dotenv import load_dotenv
 
 REPO = Path(__file__).resolve().parent.parent
-REWARDS_SQL = (REPO / "sql" / "counterfactual_rewards.sql").read_text()
-FAILED_VOLUMES_SQL = (REPO / "sql" / "counterfactual_failed_volumes.sql").read_text()
+def read_sql(name):
+    return (REPO / "sql" / f"counterfactual_{name}.sql").read_text()
+
+
+REWARDS_SQL = read_sql("rewards")
+FAILED_ORDERS_SQL = read_sql("failed_orders")
+CONSISTENCY_SHARES_SQL = read_sql("consistency_shares")
 
 # CLI chain name -> analytics DB network (database is prod_<network>).
 CHAINS = {
@@ -62,22 +67,6 @@ from dbt.int_accounting_period_data__conversion_rates
 where block_number between %(block_lo)s and %(block_hi)s
 """
 
-CONSISTENCY_SHARES_SQL = """
-with selected_periods as (
-    select distinct accounting_period
-    from dbt.int_accounting_period_data__conversion_rates
-    where block_number between %(block_lo)s and %(block_hi)s
-      and accounting_period is not null
-)
-select
-    c.accounting_period,
-    '0x' || encode(c.solver, 'hex') as solver,
-    c.consistency_reward_share
-from dbt.fct_consistency_rewards_per_solver_and_accounting_period as c
-inner join selected_periods as p
-    on c.accounting_period = p.accounting_period
-order by c.accounting_period, c.solver
-"""
 
 
 def parse_endpoint(raw: str) -> dict[str, object]:
@@ -150,7 +139,7 @@ def fetch(
                 sys.exit(f"[db] no blocks found for this window in {database}")
 
             rewards = read_frame(cur, REWARDS_SQL, params)
-            volumes = read_frame(cur, FAILED_VOLUMES_SQL, params)
+            volumes = read_frame(cur, FAILED_ORDERS_SQL, params)
             periods = read_frame(cur, ACCOUNTING_PERIOD_SQL, params)
             shares = read_frame(cur, CONSISTENCY_SHARES_SQL, params)
 
