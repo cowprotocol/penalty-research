@@ -1,0 +1,200 @@
+#!/usr/bin/env python
+"""Fetch the analytics-DB inputs for the penalty-cap counterfactual notebook.
+
+Writes three CSVs per chain and window, holding only what the counterfactual
+consumes, named counterfactual_<chain>_<start>_<end>_<kind>.csv:
+
+  _rewards             sql/counterfactual_rewards.sql
+      one row per (auction, solver): capped and uncapped reward/penalty, the
+      upper reward cap, the penalty-exclusion flag, and the accounting period.
+
+  _failed_orders       sql/counterfactual_failed_orders.sql
+      one row per (auction, solver, order_uid) for orders not settled by their
+      deadline -- never settled, or settled late. Orders are NOT pre-aggregated,
+      because the proposed cap is bounded per order.
+
+  _consistency_shares  sql/counterfactual_consistency_shares.sql
+      one row per (accounting_period, solver).
+
+Source: cow-analytics-db Postgres only (ANALYTICS_DB_URL), one database per
+network: prod_<network>.
+
+Usage:
+    python scripts/fetch_counterfactual_data.py --chain ethereum --start 2026-06-30 --end 2026-07-28
+
+--start and --end must both be Tuesdays: accounting periods run Tuesday to
+Tuesday, and a partial period mis-attributes the consistency rewards.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from datetime import date, datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+import psycopg
+from dotenv import load_dotenv
+
+REPO = Path(__file__).resolve().parent.parent
+def read_sql(name):
+    return (REPO / "sql" / f"counterfactual_{name}.sql").read_text()
+
+
+REWARDS_SQL = read_sql("rewards")
+FAILED_ORDERS_SQL = read_sql("failed_orders")
+CONSISTENCY_SHARES_SQL = read_sql("consistency_shares")
+
+# CLI chain name -> analytics DB network (database is prod_<network>).
+CHAINS = {
+    "ethereum": "mainnet", "gnosis": "xdai", "arbitrum": "arbitrum-one",
+    "base": "base", "avalanche_c": "avalanche", "polygon": "polygon", "bnb": "bnb",
+}
+
+
+
+def parse_endpoint(raw: str) -> dict[str, object]:
+    try:
+        userinfo, hostinfo = raw.rsplit("@", 1)
+        user, password = userinfo.split(":", 1)
+        host, _, port = hostinfo.partition(":")
+    except ValueError as exc:
+        raise SystemExit(
+            "ANALYTICS_DB_URL must have the form user:password@host:port"
+        ) from exc
+
+    return {"host": host, "port": int(port or 5432), "user": user, "password": password}
+
+
+def read_frame(cur: psycopg.Cursor, sql: str, params: dict) -> pd.DataFrame:
+    """Run a query, building the frame in batches.
+
+    fetchall() would hold the full list of row tuples and the DataFrame at the
+    same time; that peak is enough to get the process OOM-killed on the busiest
+    chain, so the rows are consumed in batches instead.
+    """
+    cur.execute(sql, params)
+    columns = [description.name for description in cur.description]
+
+    frames: list[pd.DataFrame] = []
+    while rows := cur.fetchmany(10_000):
+        frames.append(pd.DataFrame(rows, columns=columns))
+
+    if not frames:
+        return pd.DataFrame(columns=columns)
+    return pd.concat(frames, ignore_index=True)
+
+
+def fetch(
+    chain: str,
+    start: datetime,
+    end: datetime,
+    timeout_s: int,
+) -> dict[str, pd.DataFrame]:
+    raw_url = os.environ.get("ANALYTICS_DB_URL")
+    if not raw_url:
+        sys.exit("ANALYTICS_DB_URL is not set.")
+
+    database = f"prod_{CHAINS[chain]}"
+    params: dict[str, object] = {"start": start, "end": end}
+    print(f"[db] {database} {start:%Y-%m-%d}..{end:%Y-%m-%d}", file=sys.stderr)
+
+    try:
+        with (
+            psycopg.connect(
+                dbname=database,
+                connect_timeout=20,
+                autocommit=True,
+                options=(
+                    "-c default_transaction_read_only=on "
+                    f"-c statement_timeout={timeout_s * 1000} "
+                    "-c timezone=UTC"
+                ),
+                **parse_endpoint(raw_url),
+            ) as conn,
+            conn.cursor() as cur,
+        ):
+            rewards = read_frame(cur, REWARDS_SQL, params)
+            volumes = read_frame(cur, FAILED_ORDERS_SQL, params)
+            shares = read_frame(cur, CONSISTENCY_SHARES_SQL, params)
+
+    except psycopg.errors.QueryCanceled:
+        sys.exit(
+            f"[db] query exceeded {timeout_s}s. Narrow the date range or "
+            "increase --db-timeout."
+        )
+    except psycopg.Error as exc:
+        sys.exit(f"[db] PostgreSQL error while reading {database}: {exc}")
+
+    if rewards.duplicated(["auction_id", "solver"]).any():
+        sys.exit("counterfactual_rewards.sql returned duplicate (auction, solver) rows")
+
+    no_period = int(rewards["accounting_period"].isna().sum())
+    if no_period:
+        sys.exit(f"{no_period}/{len(rewards)} reward rows have no accounting period")
+
+    for frame in (rewards, volumes, shares):
+        frame.insert(0, "blockchain", chain)
+
+    return {
+        "_rewards": rewards,
+        "_failed_orders": volumes,
+        "_consistency_shares": shares,
+    }
+
+
+def parse_day(value: str) -> datetime:
+    return datetime.combine(
+        date.fromisoformat(value), datetime.min.time(), tzinfo=timezone.utc
+    )
+
+
+def main() -> None:
+    load_dotenv(REPO / ".env")
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--chain", required=True, choices=sorted(CHAINS))
+    parser.add_argument("--start", required=True, type=parse_day)
+    parser.add_argument("--end", required=True, type=parse_day)
+    parser.add_argument("--db-timeout", type=int, default=900)
+    args = parser.parse_args()
+
+    # Accounting periods run Tuesday to Tuesday; an incomplete period silently
+    # mis-attributes the consistency rewards, so reject it rather than adjust it.
+    if args.start.weekday() != 1 or args.end.weekday() != 1:
+        sys.exit("--start and --end must both be Tuesdays (accounting-period bounds)")
+    if args.end <= args.start:
+        sys.exit("--end must be after --start")
+
+    stem = f"counterfactual_{args.chain}_{args.start:%Y-%m-%d}_{args.end:%Y-%m-%d}"
+    data_dir = REPO / "data"
+    paths = {
+        kind: data_dir / f"{stem}{kind}.csv"
+        for kind in ("_rewards", "_failed_orders", "_consistency_shares")
+    }
+
+    if all(path.exists() for path in paths.values()):
+        print(
+            f"[skip] cached files already exist for {args.chain}: "
+            + ", ".join(path.name for path in paths.values()),
+            file=sys.stderr,
+        )
+        return
+
+    frames = fetch(args.chain, args.start, args.end, args.db_timeout)
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    for suffix, frame in frames.items():
+        path = paths[suffix]
+        # Write via a scratch name so an interrupted run cannot leave a truncated
+        # CSV that the next run would treat as a complete cache entry.
+        scratch = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        frame.to_csv(scratch, index=False)
+        scratch.replace(path)
+        print(f"[out] wrote {len(frame)} rows -> {path}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
